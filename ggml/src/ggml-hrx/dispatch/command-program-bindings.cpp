@@ -22,6 +22,11 @@ CommandProgramBindings CommandProgramBindings::from_value_map(const ValueMap & v
             result.status.log("external value %d does not exist", id.value);
             continue;
         }
+        if (value->byte_count == 0) {
+            // An empty graph input or output (e.g. the output-row index and logits of a
+            // ubatch that produces no outputs) carries no data; its nodes are elided.
+            continue;
+        }
         const std::optional<ValueBufferBinding> buffer = values.resolve_buffer_binding(id);
         if (!buffer.has_value()) {
             result.status.log("external value %d is not bound", id.value);

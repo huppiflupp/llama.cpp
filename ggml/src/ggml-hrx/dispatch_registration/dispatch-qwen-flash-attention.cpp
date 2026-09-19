@@ -203,7 +203,15 @@ static QwenFlashAttentionMatch match_qwen_flash_attention(const Graph &       gr
         key_value_token_count = query_token_count;
         mask_binding_value    = compact_mask->alternate_value;
         mask_binding_bytes    = compact_mask->byte_count;
-    } else if (!mask_is_compact && !mask_is_capacity) {
+    } else if (mask_is_compact || mask_is_capacity) {
+        key_value_token_count = mask_is_compact ? query_token_count : key_value_capacity;
+    } else if (mask->ne[0] > query_token_count && mask->ne[0] <= key_value_capacity) {
+        // A later ubatch of a long prompt: the mask spans the cached prefix plus this
+        // ubatch (n_kv, padded). Attend over exactly those key/value rows; the mask
+        // carries causality. Previously rejected, so every prompt longer than one
+        // ubatch failed with llama_decode -3.
+        key_value_token_count = mask->ne[0];
+    } else {
         return {};
     }
     if (!is_supported_key_value_token_count(key_value_token_count)) {

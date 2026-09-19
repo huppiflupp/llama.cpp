@@ -50,6 +50,9 @@ CommandProgramBindings GraphExecutor::bind_external_value_buffers(const GraphPro
     Status                             status;
     bindings.reserve(match.external_bindings.size());
     for (const GraphProgramExternalBinding & external : match.external_bindings) {
+        if (ggml_nbytes(external.tensor) == 0) {
+            continue;  // empty input/output, see CommandProgramBindings::from_value_map
+        }
         ValueBufferBinding    value_binding;
         CommandProgramBinding binding;
         binding.value = external.value;
