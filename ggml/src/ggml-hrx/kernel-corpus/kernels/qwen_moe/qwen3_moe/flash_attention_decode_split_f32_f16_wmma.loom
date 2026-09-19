@@ -142,6 +142,39 @@ func.template<qwen3_moe.attention.decode_split.produce_partials.active> device @
     view.store %query_value, %query_stage_view[%local_query_row, %query_channel] : f16, view<16x136xf16>
   }
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %c48 = index.constant 48 : index
+  %c1_vi = index.constant 1 : index
+  %c2_vi = index.constant 2 : index
+  %c3_vi = index.constant 3 : index
+  %c4_vi = index.constant 4 : index
+  %c5_vi = index.constant 5 : index
+  %c6_vi = index.constant 6 : index
+  %c7_vi = index.constant 7 : index
+  %c0_f16x8_v = vector.constant 0.0 : vector<8xf16>
+  %v_tile_token = index.rem %workitem, %c16 : index
+  %v_channel_group = index.div %workitem, %c16 : index
+  %v_channel0 = index.mul %v_channel_group, %c8 : index
+  %v_global_channel = index.add %key_value_head_base, %v_channel0 : index
+  %v_panel0, %v_panel1, %v_panel2, %v_panel3 = scf.if %is_full_block -> (vector<8xf16>, vector<8xf16>, vector<8xf16>, vector<8xf16>) {
+    %v_block_end0 = index.add %key_origin, %c64 : index
+    %v_block_origin, %v_block_end = index.assume %key_origin, %v_block_end0 [le(%v_block_end0, %bounded_key_value_token_count)] : index, index
+    %v_block_view = buffer.view %value_aligned[%c0_offset] : buffer -> view<[%v_block_end]x[%key_value_width]xf16>
+    %v_row00 = index.add %v_block_origin, %c0 : index
+    %v_row0 = index.add %v_row00, %v_tile_token : index
+    %v_loaded0 = vector.load %v_block_view[%v_row0, %v_global_channel] : view<[%v_block_end]x[%key_value_width]xf16> -> vector<8xf16>
+    %v_row10 = index.add %v_block_origin, %c16 : index
+    %v_row1 = index.add %v_row10, %v_tile_token : index
+    %v_loaded1 = vector.load %v_block_view[%v_row1, %v_global_channel] : view<[%v_block_end]x[%key_value_width]xf16> -> vector<8xf16>
+    %v_row20 = index.add %v_block_origin, %c32 : index
+    %v_row2 = index.add %v_row20, %v_tile_token : index
+    %v_loaded2 = vector.load %v_block_view[%v_row2, %v_global_channel] : view<[%v_block_end]x[%key_value_width]xf16> -> vector<8xf16>
+    %v_row30 = index.add %v_block_origin, %c48 : index
+    %v_row3 = index.add %v_row30, %v_tile_token : index
+    %v_loaded3 = vector.load %v_block_view[%v_row3, %v_global_channel] : view<[%v_block_end]x[%key_value_width]xf16> -> vector<8xf16>
+    scf.yield %v_loaded0, %v_loaded1, %v_loaded2, %v_loaded3 : vector<8xf16>, vector<8xf16>, vector<8xf16>, vector<8xf16>
+  } else {
+    scf.yield %c0_f16x8_v, %c0_f16x8_v, %c0_f16x8_v, %c0_f16x8_v : vector<8xf16>, vector<8xf16>, vector<8xf16>, vector<8xf16>
+  }
   %score_init_values = vector.constant 0.0 : vector<4xf32>
   %score_init = vector.fragment<init> %score_init_values shape [%m, %n] : vector<4xf32>
   %score_fragment = scf.if %is_full_block -> (vector<4xf32>) {
@@ -248,20 +281,134 @@ func.template<qwen3_moe.attention.decode_split.produce_partials.active> device @
   %value_channel0 = index.add %key_value_head_base, %subgroup_output_channel : index
   %value_channel1 = index.add %key_value_head_base, %subgroup_output_channel1 : index
   %product_fragment0, %product_fragment1 = scf.if %is_full_block -> (vector<8xf16>, vector<8xf16>) {
-    %full_product_fragment0, %full_product_fragment1 = scf.for %key_tile = [%c0 to %c64 step %c16](%product_accumulator0 = %product_init0 : vector<8xf16>, %product_accumulator1 = %product_init1 : vector<8xf16>) -> (vector<8xf16>, vector<8xf16>) unroll {
-      // Retain the same logical-extent contract for the full P*V tile.
-      %value_token0 = index.add %key_origin, %key_tile : index
-      %value_token_end0 = index.add %value_token0, %c16 : index
-      %value_token, %value_token_end = index.assume %value_token0, %value_token_end0 [le(%value_token_end0, %bounded_key_value_token_count)] : index, index
-      %full_value_view = buffer.view %value_aligned[%c0_offset] : buffer -> view<[%value_token_end]x[%key_value_width]xf16>
-      %probability_fragment = vector.fragment.load<lhs> %probability_stage_view[%c0, %key_tile] shape [%m, %k] : view<16x64xf16, %probability_transposed_layout> -> vector<16xf16>
-      %value_fragment0 = vector.fragment.load<rhs> %full_value_view[%value_token, %value_channel0] shape [%k, %n] : view<[%value_token_end]x[%key_value_width]xf16> -> vector<16xf16>
-      %value_fragment1 = vector.fragment.load<rhs> %full_value_view[%value_token, %value_channel1] shape [%k, %n] : view<[%value_token_end]x[%key_value_width]xf16> -> vector<16xf16>
-      %next_product_accumulator0 = vector.mma %probability_fragment, %value_fragment0, %product_accumulator0 : vector<16xf16>, vector<16xf16>, vector<8xf16>
-      %next_product_accumulator1 = vector.mma %probability_fragment, %value_fragment1, %product_accumulator1 : vector<16xf16>, vector<16xf16>, vector<8xf16>
-      scf.yield %next_product_accumulator0, %next_product_accumulator1 : vector<8xf16>, vector<8xf16>
-    }
-    scf.yield %full_product_fragment0, %full_product_fragment1 : vector<8xf16>, vector<8xf16>
+    %v_transposed_layout = encoding.layout.strided [1, 24] : encoding<layout>
+    %v_stage_store_view = buffer.view %score_stage[%c0_offset] : buffer -> view<128x24xf16>
+    %v_stage_fragment_view = buffer.view %score_stage[%c0_offset] : buffer -> view<16x128xf16, %v_transposed_layout>
+    %v_elem0_0 = vector.extract %v_panel0[0] : vector<8xf16> -> f16
+    %v_ch0_0 = index.add %v_channel0, %c0 : index
+    view.store %v_elem0_0, %v_stage_store_view[%v_ch0_0, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem0_1 = vector.extract %v_panel0[1] : vector<8xf16> -> f16
+    %v_ch0_1 = index.add %v_channel0, %c1_vi : index
+    view.store %v_elem0_1, %v_stage_store_view[%v_ch0_1, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem0_2 = vector.extract %v_panel0[2] : vector<8xf16> -> f16
+    %v_ch0_2 = index.add %v_channel0, %c2_vi : index
+    view.store %v_elem0_2, %v_stage_store_view[%v_ch0_2, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem0_3 = vector.extract %v_panel0[3] : vector<8xf16> -> f16
+    %v_ch0_3 = index.add %v_channel0, %c3_vi : index
+    view.store %v_elem0_3, %v_stage_store_view[%v_ch0_3, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem0_4 = vector.extract %v_panel0[4] : vector<8xf16> -> f16
+    %v_ch0_4 = index.add %v_channel0, %c4_vi : index
+    view.store %v_elem0_4, %v_stage_store_view[%v_ch0_4, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem0_5 = vector.extract %v_panel0[5] : vector<8xf16> -> f16
+    %v_ch0_5 = index.add %v_channel0, %c5_vi : index
+    view.store %v_elem0_5, %v_stage_store_view[%v_ch0_5, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem0_6 = vector.extract %v_panel0[6] : vector<8xf16> -> f16
+    %v_ch0_6 = index.add %v_channel0, %c6_vi : index
+    view.store %v_elem0_6, %v_stage_store_view[%v_ch0_6, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem0_7 = vector.extract %v_panel0[7] : vector<8xf16> -> f16
+    %v_ch0_7 = index.add %v_channel0, %c7_vi : index
+    view.store %v_elem0_7, %v_stage_store_view[%v_ch0_7, %v_tile_token] : f16, view<128x24xf16>
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %probability_fragment_full0 = vector.fragment.load<lhs> %probability_stage_view[%c0, %c0] shape [%m, %k] : view<16x64xf16, %probability_transposed_layout> -> vector<16xf16>
+    %value_fragment_full0_0 = vector.fragment.load<rhs> %v_stage_fragment_view[%c0, %subgroup_output_channel] shape [%k, %n] : view<16x128xf16, %v_transposed_layout> -> vector<16xf16>
+    %value_fragment_full0_1 = vector.fragment.load<rhs> %v_stage_fragment_view[%c0, %subgroup_output_channel1] shape [%k, %n] : view<16x128xf16, %v_transposed_layout> -> vector<16xf16>
+    %full_accumulator0_0 = vector.mma %probability_fragment_full0, %value_fragment_full0_0, %product_init0 : vector<16xf16>, vector<16xf16>, vector<8xf16>
+    %full_accumulator0_1 = vector.mma %probability_fragment_full0, %value_fragment_full0_1, %product_init1 : vector<16xf16>, vector<16xf16>, vector<8xf16>
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %v_elem1_0 = vector.extract %v_panel1[0] : vector<8xf16> -> f16
+    %v_ch1_0 = index.add %v_channel0, %c0 : index
+    view.store %v_elem1_0, %v_stage_store_view[%v_ch1_0, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem1_1 = vector.extract %v_panel1[1] : vector<8xf16> -> f16
+    %v_ch1_1 = index.add %v_channel0, %c1_vi : index
+    view.store %v_elem1_1, %v_stage_store_view[%v_ch1_1, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem1_2 = vector.extract %v_panel1[2] : vector<8xf16> -> f16
+    %v_ch1_2 = index.add %v_channel0, %c2_vi : index
+    view.store %v_elem1_2, %v_stage_store_view[%v_ch1_2, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem1_3 = vector.extract %v_panel1[3] : vector<8xf16> -> f16
+    %v_ch1_3 = index.add %v_channel0, %c3_vi : index
+    view.store %v_elem1_3, %v_stage_store_view[%v_ch1_3, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem1_4 = vector.extract %v_panel1[4] : vector<8xf16> -> f16
+    %v_ch1_4 = index.add %v_channel0, %c4_vi : index
+    view.store %v_elem1_4, %v_stage_store_view[%v_ch1_4, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem1_5 = vector.extract %v_panel1[5] : vector<8xf16> -> f16
+    %v_ch1_5 = index.add %v_channel0, %c5_vi : index
+    view.store %v_elem1_5, %v_stage_store_view[%v_ch1_5, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem1_6 = vector.extract %v_panel1[6] : vector<8xf16> -> f16
+    %v_ch1_6 = index.add %v_channel0, %c6_vi : index
+    view.store %v_elem1_6, %v_stage_store_view[%v_ch1_6, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem1_7 = vector.extract %v_panel1[7] : vector<8xf16> -> f16
+    %v_ch1_7 = index.add %v_channel0, %c7_vi : index
+    view.store %v_elem1_7, %v_stage_store_view[%v_ch1_7, %v_tile_token] : f16, view<128x24xf16>
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %probability_fragment_full1 = vector.fragment.load<lhs> %probability_stage_view[%c0, %c16] shape [%m, %k] : view<16x64xf16, %probability_transposed_layout> -> vector<16xf16>
+    %value_fragment_full1_0 = vector.fragment.load<rhs> %v_stage_fragment_view[%c0, %subgroup_output_channel] shape [%k, %n] : view<16x128xf16, %v_transposed_layout> -> vector<16xf16>
+    %value_fragment_full1_1 = vector.fragment.load<rhs> %v_stage_fragment_view[%c0, %subgroup_output_channel1] shape [%k, %n] : view<16x128xf16, %v_transposed_layout> -> vector<16xf16>
+    %full_accumulator1_0 = vector.mma %probability_fragment_full1, %value_fragment_full1_0, %full_accumulator0_0 : vector<16xf16>, vector<16xf16>, vector<8xf16>
+    %full_accumulator1_1 = vector.mma %probability_fragment_full1, %value_fragment_full1_1, %full_accumulator0_1 : vector<16xf16>, vector<16xf16>, vector<8xf16>
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %v_elem2_0 = vector.extract %v_panel2[0] : vector<8xf16> -> f16
+    %v_ch2_0 = index.add %v_channel0, %c0 : index
+    view.store %v_elem2_0, %v_stage_store_view[%v_ch2_0, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem2_1 = vector.extract %v_panel2[1] : vector<8xf16> -> f16
+    %v_ch2_1 = index.add %v_channel0, %c1_vi : index
+    view.store %v_elem2_1, %v_stage_store_view[%v_ch2_1, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem2_2 = vector.extract %v_panel2[2] : vector<8xf16> -> f16
+    %v_ch2_2 = index.add %v_channel0, %c2_vi : index
+    view.store %v_elem2_2, %v_stage_store_view[%v_ch2_2, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem2_3 = vector.extract %v_panel2[3] : vector<8xf16> -> f16
+    %v_ch2_3 = index.add %v_channel0, %c3_vi : index
+    view.store %v_elem2_3, %v_stage_store_view[%v_ch2_3, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem2_4 = vector.extract %v_panel2[4] : vector<8xf16> -> f16
+    %v_ch2_4 = index.add %v_channel0, %c4_vi : index
+    view.store %v_elem2_4, %v_stage_store_view[%v_ch2_4, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem2_5 = vector.extract %v_panel2[5] : vector<8xf16> -> f16
+    %v_ch2_5 = index.add %v_channel0, %c5_vi : index
+    view.store %v_elem2_5, %v_stage_store_view[%v_ch2_5, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem2_6 = vector.extract %v_panel2[6] : vector<8xf16> -> f16
+    %v_ch2_6 = index.add %v_channel0, %c6_vi : index
+    view.store %v_elem2_6, %v_stage_store_view[%v_ch2_6, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem2_7 = vector.extract %v_panel2[7] : vector<8xf16> -> f16
+    %v_ch2_7 = index.add %v_channel0, %c7_vi : index
+    view.store %v_elem2_7, %v_stage_store_view[%v_ch2_7, %v_tile_token] : f16, view<128x24xf16>
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %probability_fragment_full2 = vector.fragment.load<lhs> %probability_stage_view[%c0, %c32] shape [%m, %k] : view<16x64xf16, %probability_transposed_layout> -> vector<16xf16>
+    %value_fragment_full2_0 = vector.fragment.load<rhs> %v_stage_fragment_view[%c0, %subgroup_output_channel] shape [%k, %n] : view<16x128xf16, %v_transposed_layout> -> vector<16xf16>
+    %value_fragment_full2_1 = vector.fragment.load<rhs> %v_stage_fragment_view[%c0, %subgroup_output_channel1] shape [%k, %n] : view<16x128xf16, %v_transposed_layout> -> vector<16xf16>
+    %full_accumulator2_0 = vector.mma %probability_fragment_full2, %value_fragment_full2_0, %full_accumulator1_0 : vector<16xf16>, vector<16xf16>, vector<8xf16>
+    %full_accumulator2_1 = vector.mma %probability_fragment_full2, %value_fragment_full2_1, %full_accumulator1_1 : vector<16xf16>, vector<16xf16>, vector<8xf16>
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %v_elem3_0 = vector.extract %v_panel3[0] : vector<8xf16> -> f16
+    %v_ch3_0 = index.add %v_channel0, %c0 : index
+    view.store %v_elem3_0, %v_stage_store_view[%v_ch3_0, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem3_1 = vector.extract %v_panel3[1] : vector<8xf16> -> f16
+    %v_ch3_1 = index.add %v_channel0, %c1_vi : index
+    view.store %v_elem3_1, %v_stage_store_view[%v_ch3_1, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem3_2 = vector.extract %v_panel3[2] : vector<8xf16> -> f16
+    %v_ch3_2 = index.add %v_channel0, %c2_vi : index
+    view.store %v_elem3_2, %v_stage_store_view[%v_ch3_2, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem3_3 = vector.extract %v_panel3[3] : vector<8xf16> -> f16
+    %v_ch3_3 = index.add %v_channel0, %c3_vi : index
+    view.store %v_elem3_3, %v_stage_store_view[%v_ch3_3, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem3_4 = vector.extract %v_panel3[4] : vector<8xf16> -> f16
+    %v_ch3_4 = index.add %v_channel0, %c4_vi : index
+    view.store %v_elem3_4, %v_stage_store_view[%v_ch3_4, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem3_5 = vector.extract %v_panel3[5] : vector<8xf16> -> f16
+    %v_ch3_5 = index.add %v_channel0, %c5_vi : index
+    view.store %v_elem3_5, %v_stage_store_view[%v_ch3_5, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem3_6 = vector.extract %v_panel3[6] : vector<8xf16> -> f16
+    %v_ch3_6 = index.add %v_channel0, %c6_vi : index
+    view.store %v_elem3_6, %v_stage_store_view[%v_ch3_6, %v_tile_token] : f16, view<128x24xf16>
+    %v_elem3_7 = vector.extract %v_panel3[7] : vector<8xf16> -> f16
+    %v_ch3_7 = index.add %v_channel0, %c7_vi : index
+    view.store %v_elem3_7, %v_stage_store_view[%v_ch3_7, %v_tile_token] : f16, view<128x24xf16>
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %probability_fragment_full3 = vector.fragment.load<lhs> %probability_stage_view[%c0, %c48] shape [%m, %k] : view<16x64xf16, %probability_transposed_layout> -> vector<16xf16>
+    %value_fragment_full3_0 = vector.fragment.load<rhs> %v_stage_fragment_view[%c0, %subgroup_output_channel] shape [%k, %n] : view<16x128xf16, %v_transposed_layout> -> vector<16xf16>
+    %value_fragment_full3_1 = vector.fragment.load<rhs> %v_stage_fragment_view[%c0, %subgroup_output_channel1] shape [%k, %n] : view<16x128xf16, %v_transposed_layout> -> vector<16xf16>
+    %full_accumulator3_0 = vector.mma %probability_fragment_full3, %value_fragment_full3_0, %full_accumulator2_0 : vector<16xf16>, vector<16xf16>, vector<8xf16>
+    %full_accumulator3_1 = vector.mma %probability_fragment_full3, %value_fragment_full3_1, %full_accumulator2_1 : vector<16xf16>, vector<16xf16>, vector<8xf16>
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    scf.yield %full_accumulator3_0, %full_accumulator3_1 : vector<8xf16>, vector<8xf16>
   } else {
     // Stage one 16x128 V panel at a time and zero every lane beyond the
     // logical KV length before the panel participates in P*V.
