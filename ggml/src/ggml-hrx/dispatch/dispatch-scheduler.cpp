@@ -115,6 +115,22 @@ static bool can_elide_layout_alias_node(const Graph &             graph,
     return is_layout_alias_node(graph, node) && value_is_available(graph, node.inputs[0], covered_nodes);
 }
 
+// A node whose output has zero elements computes nothing, so it needs no kernel.
+// llama.cpp builds such nodes, e.g. llama-perplexity's GET_ROWS over an empty
+// output-row index (f32[n,0] <- i32[0]); without this the whole graph was rejected.
+static bool is_empty_output_node(const Graph & graph, const GraphNode & node) {
+    const Value * value = graph.values().find(node.output);
+    if (value == nullptr) {
+        return false;
+    }
+    for (int d = 0; d < 4; ++d) {
+        if (value->ne[d] == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool apply_value_aliases(Graph & graph, const DispatchMatch & match, Status & status) {
     for (const DispatchValueAliasRequest & alias : match.value_aliases) {
         Status alias_status = graph.values().alias_storage(alias.target_value, alias.source_value);
@@ -168,7 +184,7 @@ bool DispatchScheduler::schedule_graph(Graph &                       graph,
         DispatchMatchDiagnostics match_diagnostics;
         if (!try_match_registration(graph, node, i, covered_nodes, plan_, *registry, next_plan_value, match,
                                     &match_diagnostics)) {
-            if (can_elide_layout_alias_node(graph, *node, covered_nodes)) {
+            if (can_elide_layout_alias_node(graph, *node, covered_nodes) || is_empty_output_node(graph, *node)) {
                 pending_diagnostics.append(match.status);
                 covered_nodes[i] = true;
                 continue;
