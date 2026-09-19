@@ -81,7 +81,7 @@
     },
     {
       "path": "qwen3_moe/flash_attention_decode_split_f32_f16_wmma.loom",
-      "sha256": "466b17c488f5c0889aa55c208894a67eb6db0e1d91ba0e08a5b3e8fb4c82a94f",
+      "sha256": "204a726d22a2b3d132a1a6471df88211a5cc897ad982038c7cc2770765b908af",
       "size": 94449
     },
     {
