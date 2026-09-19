@@ -19,10 +19,8 @@ static constexpr KernelCatalogRef kQwenFlashAttentionDecodeSplitNextQ8Kernel =
     GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_flash_attention_decode_split_f32_f16_wmma_next_q8");
 static constexpr KernelCatalogRef kQwenFlashAttentionDecodeProducePartialsKernel =
     GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_flash_attention_decode_split_produce_partials_f32_f16_wmma");
-static constexpr KernelCatalogRef kQwenFlashAttentionDecodeReduceKernel =
-    GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_flash_attention_decode_split_reduce_f32");
-static constexpr KernelCatalogRef kQwenFlashAttentionDecodeQuantize4096Kernel =
-    GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_flash_attention_decode_split_quantize_reference_4096");
+static constexpr KernelCatalogRef kQwenFlashAttentionDecodeReduceNextQ8Kernel =
+    GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_flash_attention_decode_split_reduce_f32_next_q8");
 static constexpr int64_t kQwenAttentionHeadSize = 128;
 static constexpr int64_t kQwenQueryHeadCount    = 32;
 static constexpr int64_t kQwenKeyValueHeadCount = 4;
@@ -45,8 +43,8 @@ static bool is_supported_decode_key_value_token_count(int64_t token_count) {
     return token_count >= 1 && token_count <= 2048;
 }
 
-// Past the fused decode kernel's 2048-token bound, decode runs as separate
-// producer, reducer and Q8 pack dispatches (the kernels' own limit is 32768).
+// Past the fused decode kernel's 2048-token bound, decode runs as a producer
+// dispatch and a reducer dispatch that also packs Q8_1 (limit 32768).
 static bool is_supported_long_decode_key_value_token_count(int64_t token_count) {
     return token_count > 2048 && token_count <= 32768;
 }
@@ -417,9 +415,6 @@ static bool match_qwen_long_decode_flash_attention_next_q8_dispatch(const Dispat
         return false;
     }
     const int64_t hidden_size = match.query_head_count * kQwenAttentionHeadSize;
-    if (hidden_size != 4096) {
-        return false;  // the Q8 pack kernel is specialized for 32 x 128
-    }
 
     const int64_t key_value_block_count = ceil_div(match.key_value_capacity, kQwenDecodeKvTileSize);
     const size_t  partial_scalar_count  = static_cast<size_t>(match.key_value_head_count) *
@@ -483,19 +478,14 @@ static bool match_qwen_long_decode_flash_attention_next_q8_dispatch(const Dispat
         dispatch_match.dispatches.push_back(std::move(produce));
 
         Dispatch reduce;
-        reduce.kernel = make_kernel_specialization(kQwenFlashAttentionDecodeReduceKernel);
+        reduce.kernel = make_kernel_specialization(kQwenFlashAttentionDecodeReduceNextQ8Kernel);
         add_attention_config(reduce);
         reduce.bindings.push_back({ partial_max, 0, partial_scalar_bytes });
         reduce.bindings.push_back({ partial_sum, 0, partial_scalar_bytes });
         reduce.bindings.push_back({ partial_output, 0, partial_output_bytes });
         reduce.bindings.push_back({ match.output->id, output_offset, query_row_bytes });
+        reduce.bindings.push_back({ q8_output, static_cast<size_t>(row) * q8_row_bytes, q8_row_bytes });
         dispatch_match.dispatches.push_back(std::move(reduce));
-
-        Dispatch pack;
-        pack.kernel = make_kernel_specialization(kQwenFlashAttentionDecodeQuantize4096Kernel);
-        pack.bindings.push_back({ match.output->id, output_offset, query_row_bytes });
-        pack.bindings.push_back({ q8_output, static_cast<size_t>(row) * q8_row_bytes, q8_row_bytes });
-        dispatch_match.dispatches.push_back(std::move(pack));
     }
 
     dispatch_match.covered_nodes.push_back(context.root_index);

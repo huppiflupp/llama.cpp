@@ -1042,6 +1042,245 @@ kernel.def target(@qwen3_moe_decode_split_gfx11_wave64) @qwen3_moe_flash_attenti
   kernel.return
 }
 
+// Long-context reducer that also publishes the Q8_1 x4 row consumed by the
+// output projection, replacing a separate pack dispatch. One workgroup per
+// query head: four 128-lane slices split the split-K blocks for the weighted
+// output sum and combine in LDS. A head's 128 outputs are exactly one Q8_1 x4
+// group, so slice 0 packs it with the same arithmetic as the ggml packer.
+kernel.def target(@qwen3_moe_decode_split_gfx11_wave64) @qwen3_moe_flash_attention_decode_split_reduce_f32_next_q8(%key_value_token_count: index) {
+  %query_head_count = config.get @qwen3_moe.attention.query_head_count : index
+  %c1 = index.constant 1 : index
+  %c512 = index.constant 512 : index
+  kernel.launch.config workgroups(%c1, %query_head_count, %c1) workgroup_size(%c512, %c1, %c1) : index
+} launch(%key_value_token_count: index, %partial_max: buffer, %partial_sum: buffer, %partial_output: buffer, %output: buffer, %next_q8_output: buffer) {
+  %bounded_key_value_token_count = index.assume %key_value_token_count [range(%key_value_token_count, 1, 32768)] : index
+  %query_head_count = config.get @qwen3_moe.attention.query_head_count : index
+  %key_value_head_count = config.get @qwen3_moe.attention.key_value_head_count : index
+  %query_head0 = kernel.workgroup.id<y> : index
+  %query_head = index.assume %query_head0 [range(%query_head0, 0, 63)] : index
+  %workitem = kernel.workitem.id<x> : index
+  %subgroup = kernel.subgroup.id : index
+  %lane = kernel.subgroup.lane.id : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c24 = index.constant 24 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c0_offset = index.constant 0 : offset
+  %reduction_stage_bytes = index.constant 8 : offset
+  %slice_stage_bytes = index.constant 2048 : offset
+  %quant_stage_bytes = index.constant 512 : offset
+  %group_bytes = index.constant 144 : offset
+  %payload_byte_add = index.constant 16 : offset
+  %c0_f32 = scalar.constant 0.0 : f32
+  %c1_f32 = scalar.constant 1.0 : f32
+  %c127 = scalar.constant 127.0 : f32
+  %negative_large = scalar.constant -1e+30 : f32
+  %key_value_token_capacity = config.get @qwen3_moe.attention.key_value_token_capacity : index
+  %c63 = index.constant 63 : index
+  %padded_key_value_token_capacity = index.add %key_value_token_capacity, %c63 : index
+  %key_value_block_count0 = index.div %padded_key_value_token_capacity, %c64 : index
+  %key_value_block_count = index.assume %key_value_block_count0 [range(%key_value_block_count0, 1, 512)] : index
+  %query_heads_per_key_value_head0 = index.div %query_head_count, %key_value_head_count : index
+  %query_heads_per_key_value_head = index.assume %query_heads_per_key_value_head0 [range(%query_heads_per_key_value_head0, 1, 16)] : index
+  %key_value_head = index.div %query_head, %query_heads_per_key_value_head : index
+  %query_row = index.rem %query_head, %query_heads_per_key_value_head : index
+  %is_first_subgroup = index.cmp eq, %subgroup, %c0 : index
+  %workitem_is_zero = index.cmp eq, %workitem, %c0 : index
+  %slice0 = index.div %workitem, %c128 : index
+  %slice = index.assume %slice0 [range(%slice0, 0, 3)] : index
+  %output_channel0 = index.rem %workitem, %c128 : index
+  %output_channel = index.assume %output_channel0 [range(%output_channel0, 0, 127)] : index
+  %is_first_slice = index.cmp eq, %slice, %c0 : index
+  %partial_max_noalias, %partial_sum_noalias, %partial_output_noalias, %output_noalias, %next_q8_output_noalias = buffer.assume.noalias %partial_max, %partial_sum, %partial_output, %output, %next_q8_output : buffer, buffer, buffer, buffer, buffer
+  %partial_max_aligned = buffer.assume.alignment %partial_max_noalias {minimum_alignment = 16} : buffer
+  %partial_sum_aligned = buffer.assume.alignment %partial_sum_noalias {minimum_alignment = 16} : buffer
+  %partial_output_aligned = buffer.assume.alignment %partial_output_noalias {minimum_alignment = 16} : buffer
+  %output_aligned = buffer.assume.alignment %output_noalias {minimum_alignment = 16} : buffer
+  %partial_max_view = buffer.view %partial_max_aligned[%c0_offset] : buffer -> view<[%key_value_head_count]x[%key_value_block_count]x16xf32>
+  %partial_sum_view = buffer.view %partial_sum_aligned[%c0_offset] : buffer -> view<[%key_value_head_count]x[%key_value_block_count]x16xf32>
+  %partial_output_view = buffer.view %partial_output_aligned[%c0_offset] : buffer -> view<[%key_value_head_count]x[%key_value_block_count]x16x128xf16>
+  %output_view = buffer.view %output_aligned[%c0_offset] : buffer -> view<[%query_head_count]x128xf32>
+  %reduction_stage = buffer.alloca<workgroup> align(8) %reduction_stage_bytes : buffer
+  %reduction_stage_view = buffer.view %reduction_stage[%c0_offset] : buffer -> view<2xf32>
+  %slice_stage = buffer.alloca<workgroup> align(16) %slice_stage_bytes : buffer
+  %slice_stage_view = buffer.view %slice_stage[%c0_offset] : buffer -> view<4x128xf32>
+  %quant_stage = buffer.alloca<workgroup> align(16) %quant_stage_bytes : buffer
+  %quant_stage_view = buffer.view %quant_stage[%c0_offset] : buffer -> view<128xf32>
+  %lane_maximum = scf.if %is_first_subgroup -> (f32) {
+    %maximum = scf.for %block = [%lane to %key_value_block_count step %c64](%running_maximum = %negative_large : f32) -> (f32) {
+      %block_maximum = view.load %partial_max_view[%key_value_head, %block, %query_row] : view<[%key_value_head_count]x[%key_value_block_count]x16xf32> -> f32
+      %next_maximum = scalar.maxnumf %running_maximum, %block_maximum : f32
+      scf.yield %next_maximum : f32
+    }
+    scf.yield %maximum : f32
+  } else {
+    scf.yield %negative_large : f32
+  }
+  %subgroup_maximum = kernel.subgroup.reduce<maxnumf> %lane_maximum : f32
+  scf.if %workitem_is_zero {
+    view.store %subgroup_maximum, %reduction_stage_view[%c0] : f32, view<2xf32>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %maximum = view.load %reduction_stage_view[%c0] : view<2xf32> -> f32
+  %lane_sum = scf.if %is_first_subgroup -> (f32) {
+    %sum = scf.for %block = [%lane to %key_value_block_count step %c64](%running_sum = %c0_f32 : f32) -> (f32) {
+      %block_maximum = view.load %partial_max_view[%key_value_head, %block, %query_row] : view<[%key_value_head_count]x[%key_value_block_count]x16xf32> -> f32
+      %delta = scalar.subf<reassoc|nnan|ninf|nsz> %block_maximum, %maximum : f32
+      %scale = scalar.expf<afn> %delta : f32
+      view.store %scale, %partial_max_view[%key_value_head, %block, %query_row] : f32, view<[%key_value_head_count]x[%key_value_block_count]x16xf32>
+      %block_sum = view.load %partial_sum_view[%key_value_head, %block, %query_row] : view<[%key_value_head_count]x[%key_value_block_count]x16xf32> -> f32
+      %scaled_sum = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %block_sum, %scale : f32
+      %next_sum = scalar.addf<reassoc|nnan|ninf|nsz> %running_sum, %scaled_sum : f32
+      scf.yield %next_sum : f32
+    }
+    scf.yield %sum : f32
+  } else {
+    scf.yield %c0_f32 : f32
+  }
+  %subgroup_sum = kernel.subgroup.reduce<addf> %lane_sum : f32
+  scf.if %workitem_is_zero {
+    view.store %subgroup_sum, %reduction_stage_view[%c1] : f32, view<2xf32>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %sum = view.load %reduction_stage_view[%c1] : view<2xf32> -> f32
+  %slice_output = scf.for %block = [%slice to %key_value_block_count step %c4](%running_output = %c0_f32 : f32) -> (f32) {
+    %scale = view.load %partial_max_view[%key_value_head, %block, %query_row] : view<[%key_value_head_count]x[%key_value_block_count]x16xf32> -> f32
+    %block_output_f16 = view.load %partial_output_view[%key_value_head, %block, %query_row, %output_channel] : view<[%key_value_head_count]x[%key_value_block_count]x16x128xf16> -> f16
+    %block_output = scalar.extf %block_output_f16 : f16 to f32
+    %scaled_output = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %block_output, %scale : f32
+    %next_output = scalar.addf<reassoc|nnan|ninf|nsz> %running_output, %scaled_output : f32
+    scf.yield %next_output : f32
+  }
+  view.store %slice_output, %slice_stage_view[%slice, %output_channel] : f32, view<4x128xf32>
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %slice_output0 = view.load %slice_stage_view[%c0, %output_channel] : view<4x128xf32> -> f32
+  %slice_output1 = view.load %slice_stage_view[%c1, %output_channel] : view<4x128xf32> -> f32
+  %slice_output2 = view.load %slice_stage_view[%c2, %output_channel] : view<4x128xf32> -> f32
+  %c3 = index.constant 3 : index
+  %slice_output3 = view.load %slice_stage_view[%c3, %output_channel] : view<4x128xf32> -> f32
+  %pair_output0 = scalar.addf<reassoc|nnan|ninf|nsz> %slice_output0, %slice_output1 : f32
+  %pair_output1 = scalar.addf<reassoc|nnan|ninf|nsz> %slice_output2, %slice_output3 : f32
+  %unnormalized_output = scalar.addf<reassoc|nnan|ninf|nsz> %pair_output0, %pair_output1 : f32
+  %normalized_output = scalar.divf<nnan|ninf|nsz|arcp> %unnormalized_output, %sum : f32
+  scf.if %is_first_slice {
+    view.store %normalized_output, %output_view[%query_head, %output_channel] : f32, view<[%query_head_count]x128xf32>
+  }
+  // Q8_1 x4: per 32-channel block, d = amax / 127, q = round(x / d),
+  // s = d * sum(q); metadata (d, s) as f16 pairs, then 128 int8 payload bytes.
+  %output_vector = vector.from_elements %normalized_output : vector<1xf32>
+  %absolute_vector = vector.absf %output_vector : vector<1xf32>
+  %absolute_value = vector.extract %absolute_vector[0] : vector<1xf32> -> f32
+  scf.if %is_first_slice {
+    view.store %absolute_value, %quant_stage_view[%output_channel] : f32, view<128xf32>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %quant_block = index.div %output_channel, %c32 : index
+  %quant_block_base = index.mul %quant_block, %c32 : index
+  %quant_block_base8 = index.add %quant_block_base, %c8 : index
+  %quant_block_base16 = index.add %quant_block_base, %c16 : index
+  %quant_block_base24 = index.add %quant_block_base, %c24 : index
+  %block_abs0 = vector.load %quant_stage_view[%quant_block_base] : view<128xf32> -> vector<8xf32>
+  %block_abs1 = vector.load %quant_stage_view[%quant_block_base8] : view<128xf32> -> vector<8xf32>
+  %block_abs2 = vector.load %quant_stage_view[%quant_block_base16] : view<128xf32> -> vector<8xf32>
+  %block_abs3 = vector.load %quant_stage_view[%quant_block_base24] : view<128xf32> -> vector<8xf32>
+  %block_amax0 = vector.reduce<maxnumf> %block_abs0, %c0_f32 : vector<8xf32>, f32
+  %block_amax1 = vector.reduce<maxnumf> %block_abs1, %block_amax0 : vector<8xf32>, f32
+  %block_amax2 = vector.reduce<maxnumf> %block_abs2, %block_amax1 : vector<8xf32>, f32
+  %block_amax = vector.reduce<maxnumf> %block_abs3, %block_amax2 : vector<8xf32>, f32
+  %d = scalar.divf %block_amax, %c127 : f32
+  %d_nonzero = scalar.cmpf one, %d, %c0_f32 : f32
+  %d_inverse = scf.if %d_nonzero -> (f32) {
+    %inverse = scalar.divf %c1_f32, %d : f32
+    scf.yield %inverse : f32
+  } else {
+    scf.yield %c0_f32 : f32
+  }
+  %d_inverse_vector = vector.splat %d_inverse : vector<1xf32>
+  %scaled_vector = vector.mulf %output_vector, %d_inverse_vector : vector<1xf32>
+  %rounded_vector = vector.roundf %scaled_vector : vector<1xf32>
+  %quantized_vector = vector.fptosi %rounded_vector : vector<1xf32> to vector<1xi8>
+  %rounded_value = vector.extract %rounded_vector[0] : vector<1xf32> -> f32
+  %group_byte_offset = index.scale %query_head, %group_bytes : index, offset -> offset
+  %payload_byte_offset = index.add %group_byte_offset, %payload_byte_add : offset
+  %group_ds = buffer.view %next_q8_output_noalias[%group_byte_offset] : buffer -> view<8xf16>
+  %group_qs = buffer.view %next_q8_output_noalias[%payload_byte_offset] : buffer -> view<128xi8>
+  scf.if %is_first_slice {
+    vector.store %quantized_vector, %group_qs[%output_channel] : vector<1xi8>, view<128xi8>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  scf.if %is_first_slice {
+    view.store %rounded_value, %quant_stage_view[%output_channel] : f32, view<128xf32>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  %channel_in_block = index.rem %output_channel, %c32 : index
+  %is_block_leader0 = index.cmp eq, %channel_in_block, %c0 : index
+  %is_block_leader = scalar.andi %is_block_leader0, %is_first_slice : i1
+  scf.if %is_block_leader {
+    %block_q0 = vector.load %quant_stage_view[%quant_block_base] : view<128xf32> -> vector<8xf32>
+    %block_q1 = vector.load %quant_stage_view[%quant_block_base8] : view<128xf32> -> vector<8xf32>
+    %block_q2 = vector.load %quant_stage_view[%quant_block_base16] : view<128xf32> -> vector<8xf32>
+    %block_q3 = vector.load %quant_stage_view[%quant_block_base24] : view<128xf32> -> vector<8xf32>
+    %block_qsum0 = vector.reduce<addf> %block_q0, %c0_f32 : vector<8xf32>, f32
+    %block_qsum1 = vector.reduce<addf> %block_q1, %c0_f32 : vector<8xf32>, f32
+    %block_qsum2 = vector.reduce<addf> %block_q2, %c0_f32 : vector<8xf32>, f32
+    %block_qsum3 = vector.reduce<addf> %block_q3, %c0_f32 : vector<8xf32>, f32
+    %block_qsum01 = scalar.addf %block_qsum0, %block_qsum1 : f32
+    %block_qsum23 = scalar.addf %block_qsum2, %block_qsum3 : f32
+    %block_qsum = scalar.addf %block_qsum01, %block_qsum23 : f32
+    %s = scalar.mulf %block_qsum, %d : f32
+    %d_f16 = scalar.fptrunc %d : f32 to f16
+    %s_f16 = scalar.fptrunc %s : f32 to f16
+    %ds_index = index.mul %quant_block, %c2 : index
+    %s_index = index.add %ds_index, %c1 : index
+    view.store %d_f16, %group_ds[%ds_index] : f16, view<8xf16>
+    view.store %s_f16, %group_ds[%s_index] : f16, view<8xf16>
+  }
+  kernel.return
+}
+
+// Test-only: canonical Q8_1 x4 packing of a completed 32x128 attention row.
+kernel.def target(@qwen3_moe_decode_split_gfx11_wave64) @qwen3_moe_flash_attention_decode_split_pack_reference_q8_test() {
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%c1, %c4, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%input: buffer, %output: buffer) {
+  %key_value_head = kernel.workgroup.id<y> : index
+  func.apply<qwen3_moe.attention.decode_split.pack_completed_q8>(%key_value_head, %input, %output) : (index, buffer, buffer)
+  kernel.return
+}
+
+// The fused-pack reducer matches the separate reducer (up to summation
+// order) and the canonical Q8_1 x4 packing of its own F32 output bit for bit.
+check.case public @qwen3_moe_flash_attention_decode_split_reduce_next_q8_case {
+  %key_value_token_count = check.literal value(8192) : index
+  %max_seed = check.param.seed base(0x5244513852454431) count(1) : i64
+  %sum_seed = check.param.seed base(0x5244513852454432) count(1) : i64
+  %output_seed = check.param.seed base(0x5244513852454433) count(1) : i64
+  %reference_max = check.generate.random.uniform seed(%max_seed) range(-4.0 to 4.0) : tensor<4x128x16xf32>
+  %reference_sum = check.generate.random.uniform seed(%sum_seed) range(0.5 to 8.0) : tensor<4x128x16xf32>
+  %reference_partial = check.generate.random.uniform seed(%output_seed) range(-1.0 to 1.0) : tensor<4x128x16x128xf16>
+  %actual_max = check.generate.random.uniform seed(%max_seed) range(-4.0 to 4.0) : tensor<4x128x16xf32>
+  %actual_sum = check.generate.random.uniform seed(%sum_seed) range(0.5 to 8.0) : tensor<4x128x16xf32>
+  %actual_partial = check.generate.random.uniform seed(%output_seed) range(-1.0 to 1.0) : tensor<4x128x16x128xf16>
+  %reference_output = check.generate.fill value(-1.0) : tensor<32x128xf32>
+  %actual_output = check.generate.fill value(-1.0) : tensor<32x128xf32>
+  %reference_q8 = check.generate.fill value(0) : tensor<4608xi8>
+  %actual_q8 = check.generate.fill value(1) : tensor<4608xi8>
+  kernel.launch @qwen3_moe_flash_attention_decode_split_reduce_f32[%key_value_token_count](%key_value_token_count, %reference_max, %reference_sum, %reference_partial, %reference_output) : [index](index, tensor<4x128x16xf32>, tensor<4x128x16xf32>, tensor<4x128x16x128xf16>, tensor<32x128xf32>)
+  kernel.launch @qwen3_moe_flash_attention_decode_split_reduce_f32_next_q8[%key_value_token_count](%key_value_token_count, %actual_max, %actual_sum, %actual_partial, %actual_output, %actual_q8) : [index](index, tensor<4x128x16xf32>, tensor<4x128x16xf32>, tensor<4x128x16x128xf16>, tensor<32x128xf32>, tensor<4608xi8>)
+  kernel.launch @qwen3_moe_flash_attention_decode_split_pack_reference_q8_test(%actual_output, %reference_q8) : (tensor<32x128xf32>, tensor<4608xi8>)
+  check.expect.close actual(%actual_output) expected(%reference_output) atol(0.0001) rtol(0.0001) nan(same) : tensor<32x128xf32>
+  check.expect.equal actual(%actual_q8) expected(%reference_q8) : tensor<4608xi8>
+  check.return
+}
+
 check.case public @qwen3_moe_flash_attention_decode_split_f32_f16_wmma_case {
   %key_value_token_count = check.literal value(256) : index
   %query = check.generate.fill value(1.0) : tensor<32x128xf32>

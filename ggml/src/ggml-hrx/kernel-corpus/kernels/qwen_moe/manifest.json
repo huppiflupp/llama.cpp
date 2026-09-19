@@ -81,8 +81,8 @@
     },
     {
       "path": "qwen3_moe/flash_attention_decode_split_f32_f16_wmma.loom",
-      "sha256": "204a726d22a2b3d132a1a6471df88211a5cc897ad982038c7cc2770765b908af",
-      "size": 94449
+      "sha256": "b1ed0908f1fa0f9fd52c972635cbf33a1ba147c5159d448addd6467ca30992a7",
+      "size": 111210
     },
     {
       "path": "qwen3_moe/flash_attention_decode_split_next_q8_test.loom",
@@ -2362,6 +2362,46 @@
         "output"
       ],
       "binding_access": [
+        "read_write",
+        "read_write",
+        "read_write",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "qwen3_moe/flash_attention_decode_split_f32_f16_wmma.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "qwen3_moe_flash_attention_decode_split_reduce_f32_next_q8",
+      "symbol": "qwen3_moe_flash_attention_decode_split_reduce_f32_next_q8",
+      "source": "qwen3_moe/flash_attention_decode_split_f32_f16_wmma.loom",
+      "workload_parameters": [
+        {
+          "name": "key_value_token_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "key_value_token_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "partial_max",
+        "partial_sum",
+        "partial_output",
+        "output",
+        "next_q8_output"
+      ],
+      "binding_access": [
+        "read_write",
         "read_write",
         "read_write",
         "read_write",
