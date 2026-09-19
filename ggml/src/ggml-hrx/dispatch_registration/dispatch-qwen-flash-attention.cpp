@@ -17,6 +17,12 @@ static constexpr KernelCatalogRef kQwenFlashAttentionF32F16WmmaKernel =
     GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_flash_attention_f32_f16_wmma");
 static constexpr KernelCatalogRef kQwenFlashAttentionDecodeSplitNextQ8Kernel =
     GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_flash_attention_decode_split_f32_f16_wmma_next_q8");
+static constexpr KernelCatalogRef kQwenFlashAttentionDecodeProducePartialsKernel =
+    GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_flash_attention_decode_split_produce_partials_f32_f16_wmma");
+static constexpr KernelCatalogRef kQwenFlashAttentionDecodeReduceKernel =
+    GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_flash_attention_decode_split_reduce_f32");
+static constexpr KernelCatalogRef kQwenFlashAttentionDecodeQuantize4096Kernel =
+    GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_flash_attention_decode_split_quantize_reference_4096");
 static constexpr int64_t kQwenAttentionHeadSize = 128;
 static constexpr int64_t kQwenQueryHeadCount    = 32;
 static constexpr int64_t kQwenKeyValueHeadCount = 4;
@@ -37,6 +43,12 @@ static bool is_supported_key_value_token_count(int64_t token_count) {
 
 static bool is_supported_decode_key_value_token_count(int64_t token_count) {
     return token_count >= 1 && token_count <= 2048;
+}
+
+// Past the fused decode kernel's 2048-token bound, decode runs as separate
+// producer, reducer and Q8 pack dispatches (the kernels' own limit is 32768).
+static bool is_supported_long_decode_key_value_token_count(int64_t token_count) {
+    return token_count > 2048 && token_count <= 32768;
 }
 
 static bool is_qwen_flash_decode_query_length(int64_t query_length) {
@@ -242,7 +254,8 @@ static QwenFlashAttentionMatch match_qwen_flash_attention(const Graph &       gr
 }
 
 static QwenDecodeSplitFlashAttentionMatch match_qwen_decode_split_flash_attention(const Graph &     graph,
-                                                                                  const GraphNode * node) {
+                                                                                  const GraphNode * node,
+                                                                                  bool              long_context) {
     QwenDecodeSplitFlashAttentionMatch match;
     if (node == nullptr || node->op != GGML_OP_FLASH_ATTN_EXT || node->inputs.size() != 4 ||
         !has_qwen_flash_attention_params(*node)) {
@@ -276,7 +289,9 @@ static QwenDecodeSplitFlashAttentionMatch match_qwen_decode_split_flash_attentio
     const int64_t key_value_head_count  = key->ne[2];
     const int64_t key_value_token_count = mask->ne[0];
     if (!is_qwen_flash_decode_query_length(query_token_count) ||
-        !is_supported_decode_key_value_token_count(key_value_token_count) || query_head_count != kQwenQueryHeadCount ||
+        !(long_context ? is_supported_long_decode_key_value_token_count(key_value_token_count) :
+                         is_supported_decode_key_value_token_count(key_value_token_count)) ||
+        query_head_count != kQwenQueryHeadCount ||
         key_value_head_count != kQwenKeyValueHeadCount || key_value_capacity < key_value_token_count ||
         value->ne[1] != key_value_capacity || value->ne[2] != key_value_head_count ||
         mask->ne[1] != query_token_count || output->ne[1] != query_head_count || output->ne[2] != query_token_count) {
@@ -307,7 +322,7 @@ static QwenDecodeSplitFlashAttentionMatch match_qwen_decode_split_flash_attentio
 static bool match_qwen_decode_split_flash_attention_next_q8_dispatch(const DispatchMatchContext & context,
                                                                      DispatchMatch &              dispatch_match) {
     const QwenDecodeSplitFlashAttentionMatch match =
-        match_qwen_decode_split_flash_attention(context.graph, context.root_node);
+        match_qwen_decode_split_flash_attention(context.graph, context.root_node, false);
     if (!match.matched()) {
         return false;
     }
@@ -394,6 +409,105 @@ static bool match_qwen_decode_split_flash_attention_next_q8_dispatch(const Dispa
     return true;
 }
 
+static bool match_qwen_long_decode_flash_attention_next_q8_dispatch(const DispatchMatchContext & context,
+                                                                    DispatchMatch &              dispatch_match) {
+    const QwenDecodeSplitFlashAttentionMatch match =
+        match_qwen_decode_split_flash_attention(context.graph, context.root_node, true);
+    if (!match.matched()) {
+        return false;
+    }
+    const int64_t hidden_size = match.query_head_count * kQwenAttentionHeadSize;
+    if (hidden_size != 4096) {
+        return false;  // the Q8 pack kernel is specialized for 32 x 128
+    }
+
+    const int64_t key_value_block_count = ceil_div(match.key_value_capacity, kQwenDecodeKvTileSize);
+    const size_t  partial_scalar_count  = static_cast<size_t>(match.key_value_head_count) *
+                                        static_cast<size_t>(key_value_block_count) *
+                                        static_cast<size_t>(kQwenDecodeRowCapacity);
+    const size_t  partial_scalar_bytes = partial_scalar_count * sizeof(float);
+    const size_t  partial_output_bytes =
+        partial_scalar_count * static_cast<size_t>(kQwenAttentionHeadSize) * sizeof(ggml_fp16_t);
+    const size_t q8_row_bytes    = q8_1_x4_byte_count(1, hidden_size);
+    const size_t q8_output_bytes = q8_1_x4_byte_count(match.query_token_count, hidden_size);
+    if (partial_scalar_bytes == 0 || partial_output_bytes == 0 || q8_row_bytes == 0 || q8_output_bytes == 0) {
+        return false;
+    }
+
+    const ValueId partial_max    = match_value(context, dispatch_match, 0);
+    const ValueId partial_sum    = match_value(context, dispatch_match, 1);
+    const ValueId partial_output = match_value(context, dispatch_match, 2);
+    const ValueId q8_output      = match_value(context, dispatch_match, 3);
+    dispatch_match.transients.push_back(
+        { partial_max, "qwen.decode_long.flash_attention.partial_max", partial_scalar_bytes, 256 });
+    dispatch_match.transients.push_back(
+        { partial_sum, "qwen.decode_long.flash_attention.partial_sum", partial_scalar_bytes, 256 });
+    dispatch_match.transients.push_back(
+        { partial_output, "qwen.decode_long.flash_attention.partial_output", partial_output_bytes, 256 });
+    dispatch_match.transients.push_back(
+        { q8_output, "qwen.decode_long.flash_attention.next_q8_output", q8_output_bytes, 256 });
+
+    Status metadata_status;
+    if (!dispatch_match.metadata.append_alternate_value({ match.output->id, q8_output, GGML_TYPE_Q8_1, q8_output_bytes,
+                                                          "qwen.decode_long.flash_attention.next_q8_output" },
+                                                        metadata_status)) {
+        dispatch_match.status.append(metadata_status);
+        return false;
+    }
+
+    const auto add_attention_config = [&](Dispatch & dispatch) {
+        dispatch.kernel.integer_parameters.emplace("key_value_token_count", match.key_value_token_count);
+        dispatch.kernel.compile_parameters.emplace("qwen3_moe.attention.query_head_count",
+                                                   to_config_value(match.query_head_count));
+        dispatch.kernel.compile_parameters.emplace("qwen3_moe.attention.key_value_head_count",
+                                                   to_config_value(match.key_value_head_count));
+        dispatch.kernel.compile_parameters.emplace("qwen3_moe.attention.key_value_token_capacity",
+                                                   to_config_value(match.key_value_capacity));
+    };
+    const size_t query_row_bytes = static_cast<size_t>(hidden_size) * sizeof(float);
+    const size_t mask_row_bytes  = static_cast<size_t>(match.key_value_token_count) * sizeof(ggml_fp16_t);
+    for (int64_t row = 0; row < match.query_token_count; ++row) {
+        const size_t output_offset = static_cast<size_t>(row) * match.output->nb[2];
+
+        Dispatch produce;
+        produce.kernel = make_kernel_specialization(kQwenFlashAttentionDecodeProducePartialsKernel);
+        add_attention_config(produce);
+        produce.bindings.push_back(
+            { match.query->id, static_cast<size_t>(row) * match.query->nb[1], query_row_bytes });
+        produce.bindings.push_back({ match.key->id, 0, match.key->byte_count });
+        produce.bindings.push_back({ match.value->id, 0, match.value->byte_count });
+        produce.bindings.push_back({ match.mask->id, static_cast<size_t>(row) * match.mask->nb[1], mask_row_bytes });
+        produce.bindings.push_back({ partial_max, 0, partial_scalar_bytes });
+        produce.bindings.push_back({ partial_sum, 0, partial_scalar_bytes });
+        produce.bindings.push_back({ partial_output, 0, partial_output_bytes });
+        dispatch_match.dispatches.push_back(std::move(produce));
+
+        Dispatch reduce;
+        reduce.kernel = make_kernel_specialization(kQwenFlashAttentionDecodeReduceKernel);
+        add_attention_config(reduce);
+        reduce.bindings.push_back({ partial_max, 0, partial_scalar_bytes });
+        reduce.bindings.push_back({ partial_sum, 0, partial_scalar_bytes });
+        reduce.bindings.push_back({ partial_output, 0, partial_output_bytes });
+        reduce.bindings.push_back({ match.output->id, output_offset, query_row_bytes });
+        dispatch_match.dispatches.push_back(std::move(reduce));
+
+        Dispatch pack;
+        pack.kernel = make_kernel_specialization(kQwenFlashAttentionDecodeQuantize4096Kernel);
+        pack.bindings.push_back({ match.output->id, output_offset, query_row_bytes });
+        pack.bindings.push_back({ q8_output, static_cast<size_t>(row) * q8_row_bytes, q8_row_bytes });
+        dispatch_match.dispatches.push_back(std::move(pack));
+    }
+
+    dispatch_match.covered_nodes.push_back(context.root_index);
+    if (match.output_layout != nullptr) {
+        if (!append_covered_node_index_once(context.graph, context.covered_nodes, match.output_layout,
+                                            dispatch_match.covered_nodes)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool match_qwen_flash_attention_dispatch(const DispatchMatchContext & context, DispatchMatch & dispatch_match) {
     const QwenFlashAttentionMatch match = match_qwen_flash_attention(context.graph, context.plan, context.root_node);
     if (!match.matched()) {
@@ -435,6 +549,14 @@ void register_qwen_flash_attention_dispatches(DispatchRegistryBuilder & registry
         200,
         DispatchSource::Qwen,
         match_qwen_decode_split_flash_attention_next_q8_dispatch,
+    });
+    registry.add({
+        "qwen.flash_attention_decode_long_next_q8",
+        GGML_OP_FLASH_ATTN_EXT,
+        DispatchMatchKind::SingleOp,
+        150,
+        DispatchSource::Qwen,
+        match_qwen_long_decode_flash_attention_next_q8_dispatch,
     });
     registry.add({
         "qwen.flash_attention_f32_f16_wmma",
