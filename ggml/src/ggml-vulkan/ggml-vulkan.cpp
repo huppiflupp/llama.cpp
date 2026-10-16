@@ -4639,7 +4639,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
             }
         }
@@ -14029,7 +14029,10 @@ static bool ggml_vk_gdn_chunk_ok(const ggml_backend_vk_context * ctx, const ggml
            k->nb[1] == q->nb[1] && k->nb[2] == q->nb[2] && k->nb[3] == q->nb[3] && v->ne[1] % q->ne[1] == 0;
 }
 
-void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+// GATED_DELTA_NET, optionally fused with the CPY that stores its state snapshots into the recurrent cache
+// (see ggml_vk_gdn_cache_pattern, halo-tuning glm/0009): then the snapshots are written straight into the cache.
+void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * dst = cgraph->nodes[node_idx];
     // q/k l2 norms folded into the chunk prep (ggml_vk_gdn_qk_norm_prepass): read the raw views
     const auto qk_it = ctx->gdn_qk.find(dst);
     const ggml_backend_vk_context::gdn_qk_norm * qkn = qk_it != ctx->gdn_qk.end() ? &qk_it->second : nullptr;
@@ -14060,6 +14063,18 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     for (int i = 0; i < 6; i++) {
         src_buf[i] = ggml_vk_tensor_subbuffer(ctx, i == 0 ? src_q : i == 1 ? src_k : dst->src[i], qkn != nullptr && i < 2);
     }
+    // unused binding gets a dummy
+    vk_subbuffer cache_buf = dst_buf;
+    uint32_t cache_out = 0, cache_seq_stride = 0, cache_slot_stride = 0;
+    if (ctx->num_additional_fused_ops > 0) {
+        // the fused CPY node is a view of the cache rows: [D, n_seqs, n_written]
+        const ggml_tensor * cpy = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+        GGML_ASSERT(cpy->op == GGML_OP_CPY);
+        cache_buf         = ggml_vk_tensor_subbuffer(ctx, cpy);
+        cache_out         = 1;
+        cache_seq_stride  = (uint32_t)(cpy->nb[1] / sizeof(float));
+        cache_slot_stride = (uint32_t)(cpy->nb[2] / sizeof(float));
+    }
 
     const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
     const uint32_t sq2 = (uint32_t)(src_q->nb[2] / sizeof(float));
@@ -14082,7 +14097,8 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
-        K
+        K,
+        cache_out, cache_seq_stride, cache_slot_stride,
     };
 
     // chunked prefill form (ggml_vk_gdn_chunk_ok): f16 WMMA operands, f32 accumulation, not bit-identical to the sequential
@@ -14139,7 +14155,7 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     }
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, cache_buf},
         pc, { H, n_seqs, S_v });
 }
 
@@ -16929,7 +16945,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
 
     case GGML_OP_GATED_DELTA_NET:
-        ggml_vk_gated_delta_net(ctx, compute_ctx, node);
+        ggml_vk_gated_delta_net(ctx, compute_ctx, cgraph, node_idx);
 
         break;
 
@@ -18517,6 +18533,85 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
     }
 
     return true;
+}
+
+// GATED_DELTA_NET followed (after view nodes only) by the CPY that stores its state snapshots into the recurrent
+// cache: [D, n_seqs, n_written] rows, rollback group i at slot stride nb[2] (see build_recurrent_attn). The shader
+// then writes the snapshots straight into the cache and the CPY is skipped. Returns the index distance to the CPY
+// (the number of additional fused nodes), 0 when the pattern does not match.
+// With ignore_buffers, only the graph structure is checked (graph_optimize runs before allocation).
+// From halo-tuning glm/0009 without the ids part. GGML_VK_LAB_NO_GDN_CACHE=1 turns it off.
+static int ggml_vk_gdn_cache_pattern(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx,
+                                     bool ignore_buffers) {
+    static const bool disabled = getenv("GGML_VK_LAB_NO_GDN_CACHE") != nullptr;
+    const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    if (disabled || gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    const ggml_tensor * src_v    = gdn->src[2];
+    const int64_t       S_v      = src_v->ne[0];
+    const int64_t       H        = src_v->ne[1];
+    const int64_t       n_tokens = src_v->ne[2];
+    const int64_t       n_seqs   = src_v->ne[3];
+    const int64_t       D        = S_v * S_v * H;
+    const int64_t       K        = ggml_get_op_params_i32(gdn, 0);
+    const int64_t       n_written = std::min<int64_t>(n_tokens, K);
+    const size_t        tail_off  = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
+
+    // the chunked prefill form and the q/k norm prepass write the state themselves: no fusion there
+    if (K == 1 && n_tokens >= ggml_vk_gdn_chunk_min) {
+        return 0;
+    }
+    if (ctx != nullptr && (ctx->gdn_qk.count(gdn) || ggml_vk_gdn_chunk_ok(ctx, gdn, gdn->src[0], gdn->src[1]))) {
+        return 0;
+    }
+
+    const int max_dist = 8; // fits op_srcs_fused_elementwise
+    const ggml_tensor * cpy = nullptr;
+    int dist = 0;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && j <= node_idx + max_dist; ++j) {
+        ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_vk_is_empty(n)) {
+            continue;
+        }
+        if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+        cpy  = n;
+        dist = j - node_idx;
+        break;
+    }
+    if (cpy == nullptr) {
+        return 0;
+    }
+
+    const ggml_tensor * src = cpy->src[0]; // view of the snapshot tail
+    const ggml_tensor * dst = cpy->src[1]; // cache rows
+    if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != tail_off || !ggml_is_contiguous(src) ||
+        src->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
+        return 0;
+    }
+    if (dst->type != GGML_TYPE_F32 || dst->ne[0] != D || dst->ne[1] != n_seqs || dst->ne[2] != n_written || dst->ne[3] != 1 ||
+        dst->nb[0] != sizeof(float) || dst->nb[1] % sizeof(float) != 0 || dst->nb[2] % sizeof(float) != 0 ||
+        dst->nb[1] / sizeof(float) > UINT32_MAX || dst->nb[2] / sizeof(float) > UINT32_MAX) {
+        return 0;
+    }
+
+    if (ignore_buffers) {
+        return dist;
+    }
+
+    if (cpy->buffer == nullptr || get_misalign_bytes(ctx, cpy) != 0) {
+        return 0;
+    }
+    // The snapshots overwrite cache rows while other workgroups may still read their initial states. That is only
+    // safe if every seq reads its own shards (n_seqs == 1) or the initial states live elsewhere.
+    const ggml_tensor * state = gdn->src[5];
+    if (n_seqs > 1 && state->buffer && ggml_vk_tensors_overlap(state, cpy, false)) {
+        return 0;
+    }
+    return dist;
 }
 
 bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
@@ -20242,6 +20337,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_ssm_conv_direct = -1;
         std::fill(std::begin(ctx->fused_extra_srcs), std::end(ctx->fused_extra_srcs), nullptr);
         const char *fusion_string {};
+        bool skip_overlap_check = false;
         int hc_moe_mode = HC_POST_NORM_NONE;
         bool hc_moe_inj = false;
         int hc_moe_front = 0;
@@ -20499,6 +20595,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "SSM_CONV_SILU";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (int gdn_dist = ggml_vk_gdn_cache_pattern(ctx, cgraph, i, false)) {
+                ctx->num_additional_fused_ops = gdn_dist;
+                fusion_string = "GDN_CACHE";
+                // the op writes the scores (its own dst) and the snapshots (the CPY dst)
+                ctx->fused_ops_write_mask |= 1;
+                std::fill_n(op_srcs_fused_elementwise, gdn_dist + 1, false);
+                // the state may be read from the rows the snapshots overwrite: ggml_vk_gdn_cache_pattern checked it
+                skip_overlap_check = true;
             } else if (ggml_can_fuse_subgraph(cgraph, i, rope_view_set_rows_pattern, { i + 2 }) &&
                        ggml_check_edges(cgraph, i, rope_view_set_rows_edges) &&
                        ggml_vk_can_fuse_rope_set_rows(ctx, cgraph, i)) {
@@ -20608,7 +20712,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         // Check whether fusion would overwrite src operands while they're still in use.
         // If so, disable fusion.
-        if (ctx->num_additional_fused_ops) {
+        if (ctx->num_additional_fused_ops && !skip_overlap_check) {
             // There are up to two output nodes - topk_moe has two.
             uint32_t bits = ctx->fused_ops_write_mask & ~(1 << ctx->num_additional_fused_ops);
             ggml_tensor *output_nodes[2] {};
@@ -20968,6 +21072,34 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         }
         const ggml_tensor * cpy = graph->nodes[n + len - 1];
         return cpy->op == GGML_OP_CPY && cpy->src[0] == last && cpy->type == GGML_TYPE_F16;
+    };
+
+    // distance from a GATED_DELTA_NET to its fusable snapshot CPY (0: none), see ggml_vk_gdn_cache_pattern
+    auto const &gdn_cpy_dist = [&](int g) -> int {
+        if (used[g] || graph->nodes[g]->op != GGML_OP_GATED_DELTA_NET) {
+            return 0;
+        }
+        const int dist = ggml_vk_gdn_cache_pattern(nullptr, graph, g, true);
+        for (int j = g + 1; dist > 0 && j < g + dist; ++j) {
+            const ggml_tensor * v = graph->nodes[j];
+            if (used[j]) {
+                return 0;
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * src = v->src[s];
+                if (src && src != graph->nodes[g] && src->op != GGML_OP_NONE &&
+                    used_node_set.find(const_cast<ggml_tensor *>(src)) == used_node_set.end()) {
+                    bool in_range = false;
+                    for (int k = g + 1; k < j; ++k) {
+                        in_range |= graph->nodes[k] == src;
+                    }
+                    if (!in_range) {
+                        return 0;
+                    }
+                }
+            }
+        }
+        return dist;
     };
 
     while (first_unused < graph->n_nodes) {
@@ -21530,6 +21662,25 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
         }
 
+        // GATED_DELTA_NET + views + snapshot CPY: keep them together so the CPY can be fused into the op.
+        // The views in between must only depend on the GDN or on already scheduled/leaf tensors.
+        {
+            const int dist = gdn_cpy_dist(first_unused);
+            if (dist > 0) {
+                for (int j = first_unused; j <= first_unused + dist; ++j) {
+                    if (!used[j]) {
+                        new_order.push_back(graph->nodes[j]);
+                        used_node_set.insert(graph->nodes[j]);
+                        used[j] = true;
+                    }
+                }
+                while (first_unused < graph->n_nodes && used[first_unused]) {
+                    first_unused++;
+                }
+                continue;
+            }
+        }
+
         // First, grab the next unused node.
         current_set.push_back(first_unused);
 
@@ -21595,7 +21746,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(rope_view_set_rows_pattern, j) ||
                 match_pattern(hc_post_gate_pattern, j) ||
                 !gated_norm_order(j).empty() ||
-                is_mm_cpy16(j)) {
+                is_mm_cpy16(j) ||
+                gdn_cpy_dist(j) > 0) {
                 continue;
             }
             bool ok = true;

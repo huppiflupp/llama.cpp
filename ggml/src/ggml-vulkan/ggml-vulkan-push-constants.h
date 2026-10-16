@@ -817,6 +817,9 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    uint32_t cache_out;         // write the snapshots straight into the recurrent cache (fused GDN -> CPY)
+    uint32_t cache_seq_stride;  // floats between the cache rows of two seqs
+    uint32_t cache_slot_stride; // floats between two snapshot slots in the cache
 };
 
 // gdn_chunk_prep.comp / gdn_chunk_scan.comp: the sequential kernel's constants plus the chunk count

@@ -45,6 +45,7 @@ layout(push_constant) uniform Parameters {
     uint neq1, rq3;
     float scale;
     uint K;
+    uint cache_out_unused, cache_seq_stride_unused, cache_slot_stride_unused; // vk_op_gated_delta_net_push_constants (GDN_CACHE)
     uint nch;
     uint qk_norm;
     float qk_eps;
