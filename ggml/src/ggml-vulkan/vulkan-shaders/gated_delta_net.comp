@@ -18,6 +18,8 @@ layout(constant_id = 0) const uint S_V = 128;
 layout(constant_id = 1) const uint KDA = 0;
 layout(constant_id = 2) const uint SUBGROUP_SIZE = 32;
 layout(constant_id = 3) const uint LANES_PER_COLUMN = 32;
+// q, k, g, beta are raw: l2-norm q/k, softplus(g + dt) * A, sigmoid(beta) in here (ggml_gated_delta_net_set_prologue)
+layout(constant_id = 4) const uint PROLOGUE = 0;
 
 const uint COLS_PER_WG = SUBGROUP_SIZE / LANES_PER_COLUMN;
 const uint ROWS_PER_LANE = S_V / LANES_PER_COLUMN;
@@ -40,7 +42,6 @@ layout(push_constant) uniform Parameters {
     uint cache_slot_stride; // floats between two snapshot slots in the cache
     uint state_seq_stride;  // floats between the initial states of two seqs (rows of the state buffer with ids)
     uint use_ids;           // initial state of seq s is row ids[s] (ggml_gated_delta_net_ids)
-    uint prologue;          // q, k, g, beta are raw: l2-norm q/k, softplus(g + dt) * A, sigmoid(beta) in here
     float l2_eps;           // eps of the q/k rms_norm (already divided by S_k)
     float l2_scale;         // the scale after the q/k rms_norm (1/sqrt(S_k), as computed by the graph)
     uint l2_cols;          // S_k (runtime, for the rms_norm mean)
@@ -170,22 +171,24 @@ void main() {
         const uint k_off = q_off;
         const uint v_off = seq_id * sv3 + t * sv2 + head_id * sv1;
         const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
-        FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
+        // precise: in the prologue these are the values the separate ops of the unfused graph would store, so no
+        // contraction across them (no effect on the plain loads otherwise)
+        precise FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
 
-        FLOAT_TYPE k_reg[ROWS_PER_LANE];
-        FLOAT_TYPE q_reg[ROWS_PER_LANE];
+        precise FLOAT_TYPE k_reg[ROWS_PER_LANE];
+        precise FLOAT_TYPE q_reg[ROWS_PER_LANE];
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
             const uint i = r * LANES_PER_COLUMN + lane;
             k_reg[r] = FLOAT_TYPE(data_k[k_off + i]);
             q_reg[r] = FLOAT_TYPE(data_q[q_off + i]);
         }
 
-        FLOAT_TYPE g_raw = FLOAT_TYPE(0.0);
+        precise FLOAT_TYPE g_raw = FLOAT_TYPE(0.0);
         if (KDA == 0) {
             g_raw = FLOAT_TYPE(data_g[gb_off]);
         }
 
-        if (prologue != 0u) {
+        if (PROLOGUE != 0u) {
             // the ops of the unfused graph: scale(rms_norm(x, l2_eps), 1/sqrt(S_v)) for q and k (each lane group
             // holds the whole vector), sigmoid(beta), softplus(g + dt) * A
             const FLOAT_TYPE kk = sum_sq(k_reg);

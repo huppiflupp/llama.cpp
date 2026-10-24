@@ -825,7 +825,6 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t cache_slot_stride; // floats between two snapshot slots in the cache
     uint32_t state_seq_stride;  // floats between the initial states of two seqs (or two rows, with ids)
     uint32_t use_ids;           // initial state of seq s is row ids[s] of the state buffer
-    uint32_t prologue;          // ggml_gated_delta_net_set_prologue
     float    l2_eps;
     float    l2_scale;
     uint32_t l2_cols;

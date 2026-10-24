@@ -4621,33 +4621,38 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool use_clustered_reduce = device->subgroup_arithmetic && device->subgroup_clustered && need_partial_subgroup_reduce;
             const bool use_subgroup_reduce = device->subgroup_arithmetic && !need_partial_subgroup_reduce;
             const bool use_subgroup_ops = use_clustered_reduce || use_subgroup_reduce;
-            size_t gdn_len;
-            const void * gdn_data;
-            if (use_clustered_reduce && device->subgroup_shuffle) {
-                // same as the clustered variant, plus the bit-exact (rms_norm order) l2 norm of the prologue
-                gdn_len = gated_delta_net_f32_shuffle_len;
-                gdn_data = (const void *)gated_delta_net_f32_shuffle_data;
-            } else if (use_clustered_reduce) {
-                gdn_len = gated_delta_net_f32_len;
-                gdn_data = (const void *)gated_delta_net_f32_data;
-            } else if (use_subgroup_reduce && device->subgroup_shuffle) {
-                gdn_len = gated_delta_net_f32_nocluster_shuffle_len;
-                gdn_data = (const void *)gated_delta_net_f32_nocluster_shuffle_data;
-            } else if (use_subgroup_reduce) {
-                gdn_len = gated_delta_net_f32_nocluster_len;
-                gdn_data = (const void *)gated_delta_net_f32_nocluster_data;
-            } else {
-                gdn_len = gated_delta_net_f32_shmem_len;
-                gdn_data = (const void *)gated_delta_net_f32_shmem_data;
-            }
-
             const uint32_t cols_per_wg = gdn_subgroup_size / lanes_per_column;
             const std::array<uint32_t, 3> wg_denoms = {1u, 1u, cols_per_wg};
 
-            for (uint32_t kda = 0; kda < 2; kda++) {
-                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 11, sizeof(vk_op_gated_delta_net_push_constants),
-                    wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
+            for (uint32_t pro = 0; pro < 2; pro++) {
+                // the prologue variant (spec constant PROLOGUE, scalar gate only) takes the subgroup-shuffle build
+                // when available: its l2 sums then follow the rms_norm.comp tree (bit-identical to RMS_NORM_SCALE)
+                const bool shuffle = pro && device->subgroup_shuffle;
+                size_t gdn_len;
+                const void * gdn_data;
+                if (use_clustered_reduce && shuffle) {
+                    gdn_len = gated_delta_net_f32_shuffle_len;
+                    gdn_data = (const void *)gated_delta_net_f32_shuffle_data;
+                } else if (use_clustered_reduce) {
+                    gdn_len = gated_delta_net_f32_len;
+                    gdn_data = (const void *)gated_delta_net_f32_data;
+                } else if (use_subgroup_reduce && shuffle) {
+                    gdn_len = gated_delta_net_f32_nocluster_shuffle_len;
+                    gdn_data = (const void *)gated_delta_net_f32_nocluster_shuffle_data;
+                } else if (use_subgroup_reduce) {
+                    gdn_len = gated_delta_net_f32_nocluster_len;
+                    gdn_data = (const void *)gated_delta_net_f32_nocluster_data;
+                } else {
+                    gdn_len = gated_delta_net_f32_shmem_len;
+                    gdn_data = (const void *)gated_delta_net_f32_shmem_data;
+                }
+
+                for (uint32_t kda = 0; kda < (pro ? 1u : 2u); kda++) {
+                    const std::string name = std::string(gdn_names[si][kda]) + (pro ? "_prologue" : "");
+                    ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda][pro],
+                        name.c_str(), gdn_len, gdn_data, "main", 11, sizeof(vk_op_gated_delta_net_push_constants),
+                        wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column, pro}, 1, true, use_subgroup_ops, gdn_subgroup_size);
+                }
             }
         }
     }
@@ -12939,7 +12944,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 case 128: si = 3; break;
                 default: return nullptr;
             }
-            return ctx->device->pipeline_gated_delta_net[si][kda];
+            const uint32_t pro = ggml_get_op_params_i32(dst, 1) != 0 ? 1 : 0;
+            return ctx->device->pipeline_gated_delta_net[si][kda][pro];
         }
         return nullptr;
     case GGML_OP_SSM_SCAN:
@@ -14122,7 +14128,6 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         cache_out, cache_seq_stride, cache_slot_stride,
         state_seq_stride,
         src_ids ? 1u : 0u,
-        prologue ? 1u : 0u,
         prologue ? ggml_get_op_params_f32(dst, 2) : 0.0f,
         1.0f / sqrtf((float) S_v), // as build_gdn_l2_norm and the CPU op
         S_v,
