@@ -4179,6 +4179,80 @@ llama_model_base::nextn_flags_t llama_model_base::nextn_flags(llama_model_loader
     return { trunk, mtp };
 }
 
+ggml_tensor * llama_model_base::lab_stack_rows(const char * name, std::initializer_list<ggml_tensor **> parts) {
+    GGML_ASSERT(ml != nullptr);
+    if (parts.size() < 2 || ml->files.empty()) {
+        return nullptr;
+    }
+    ggml_tensor * t0 = *parts.begin()[0];
+    for (ggml_tensor ** pp : parts) {
+        const ggml_tensor * t = *pp;
+        if (t == nullptr || t->type != t0->type || t->ne[0] != t0->ne[0] || t->ne[2] != 1 || t->ne[3] != 1 ||
+                !ggml_is_contiguous(t) || t->view_src != nullptr || t->data != nullptr || t->buffer != nullptr ||
+                t < t0) { // creation order: the storage (t0) must come first in its context
+            return nullptr;
+        }
+    }
+
+    // the context (and buffer type) that holds all parts
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_type_t buft = nullptr;
+    for (auto & [key, ctx_ptr] : ml->ctx_map) {
+        if (ggml_get_tensor(ctx_ptr.get(), t0->name) == t0) {
+            if (key.lazy) {
+                return nullptr;
+            }
+            ctx  = ctx_ptr.get();
+            buft = key.buft;
+            break;
+        }
+    }
+    // host buffers may be mapped straight from the file (mmap), where a stacked tensor has no storage
+    if (ctx == nullptr || ggml_backend_buft_is_host(buft)) {
+        return nullptr;
+    }
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+    int64_t rows = 0;
+    size_t  offs = 0;
+    for (ggml_tensor ** pp : parts) {
+        const ggml_tensor * t = *pp;
+        if (ggml_get_tensor(ctx, t->name) != t || offs % align != 0) {
+            return nullptr;
+        }
+        rows += t->ne[1];
+        offs += ggml_nbytes(t);
+    }
+
+    // t0 becomes the storage of the stack, a new tensor with t0's name and shape views its first rows
+    const std::string name0 = t0->name;
+    const int64_t     rows0 = t0->ne[1];
+    ggml_tensor * v0 = ggml_new_tensor_2d(ctx, t0->type, t0->ne[0], rows0);
+
+    ggml_set_name(t0, name);
+    t0->ne[1] = rows;
+    t0->nb[2] = t0->nb[1] * rows;
+    t0->nb[3] = t0->nb[2];
+
+    ggml_set_name(v0, name0.c_str());
+    v0->view_src  = t0;
+    v0->view_offs = 0;
+    *parts.begin()[0] = v0;
+
+    offs = 0;
+    for (ggml_tensor ** pp : parts) {
+        ggml_tensor * t = *pp;
+        if (t != v0) {
+            t->view_src  = t0;
+            t->view_offs = offs;
+        }
+        offs += ggml_nbytes(t);
+    }
+    GGML_ASSERT(offs == ggml_nbytes(t0));
+
+    LLAMA_LOG_DEBUG("%s: %s = %zu parts, %lld rows of %s\n", __func__, name, parts.size(), (long long) rows, ggml_type_name(t0->type));
+    return t0;
+}
+
 void llama_model_base::load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first) {
     if (ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, false)) {
         return;

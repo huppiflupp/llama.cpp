@@ -628,6 +628,16 @@ struct llama_layer {
     struct llama_layer_nextn nextn;
 
     struct llama_layer_switch_lora switch_lora;
+
+    // lab (LLAMA_LAB_STACK_*): projections of the same input stacked row-wise into one weight at load time, the
+    // original tensors above are views into it (see llama_model_base::lab_stack_rows)
+    struct {
+        struct ggml_tensor * ba         = nullptr; // [ssm_beta; ssm_alpha]
+        struct ggml_tensor * qkvz       = nullptr; // [wqkv; wqkv_gate]          (delta-net layers)
+        struct ggml_tensor * qkv        = nullptr; // [wq; wk; wv]               (attention layers)
+        struct ggml_tensor * gu_shexp   = nullptr; // [ffn_gate_shexp; ffn_up_shexp]
+        struct ggml_tensor * gate_inp   = nullptr; // [ffn_gate_inp; ffn_gate_inp_shexp]
+    } lab_stk;
 };
 
 struct llama_device {
@@ -998,6 +1008,12 @@ struct llama_model_base : public llama_model {
     // helper: read the exl3.* metadata, and pair each EXL3 trellis with its scales after create_tensor made them
     void load_hparams_exl3(llama_model_loader & ml);
     void load_tensors_exl3();
+
+    // lab helper: stack 2D weights with the same type and row length row-wise into one tensor (the first part's
+    // storage, renamed to `name`), the parts become views into it, so the memory stays the same and the parts load
+    // as before. Only for device (non-host) buffers of one context, parts in creation order; returns nullptr (and
+    // changes nothing) if not possible. *parts[0] is replaced by its new view tensor.
+    ggml_tensor * lab_stack_rows(const char * name, std::initializer_list<ggml_tensor **> parts);
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
