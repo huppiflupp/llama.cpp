@@ -7147,6 +7147,195 @@ struct test_gdn_qk_root : public test_case {
     }
 };
 
+// Qwen3.5/3.6 delta-net layer, small ubatch: GATED_DELTA_NET with the initial states read through ids from a recurrent
+// cache with rollback planes (q/k/v as views of the conv output, H_k < H_v broadcast), optionally with the prologue
+// (l2 norm, softplus gate, sigmoid beta) inside the op, and the snapshot CPY back into the same cache (the backend
+// may fuse the CPY and write in place: GDN_CACHE).
+struct test_qwen_gdn_ids : public test_case {
+    const int64_t S;
+    const int64_t H_k;
+    const int64_t H_v;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int64_t K;        // snapshot slots = rollback planes
+    const int64_t mem_size; // cells per plane
+    const int64_t kv_head;  // first cell written
+    const int64_t rollback; // plane the initial states are read from
+    const bool    prologue;
+
+    std::string vars() override {
+        return VARS_TO_STR10(S, H_k, H_v, n_seq_tokens, n_seqs, K, mem_size, kv_head, rollback, prologue);
+    }
+
+    test_qwen_gdn_ids(int64_t S = 32, int64_t H_k = 2, int64_t H_v = 4, int64_t n_seq_tokens = 3, int64_t n_seqs = 1,
+            int64_t K = 3, int64_t mem_size = 2, int64_t kv_head = 1, int64_t rollback = 0, bool prologue = false)
+        : S(S), H_k(H_k), H_v(H_v), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K), mem_size(mem_size),
+          kv_head(kv_head), rollback(rollback), prologue(prologue) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return prologue ? "GATED_DELTA_NET_PROLOGUE" : "GATED_DELTA_NET_IDS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 1e-6; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const ggml_type type = GGML_TYPE_F32;
+        const int64_t D   = S * S * H_v;
+        const int64_t row = 2 * S * H_k + S * H_v;
+        const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+
+        ggml_tensor * conv = ggml_new_tensor_3d(ctx, type, row, n_seq_tokens, n_seqs);
+        ggml_set_name(conv, "conv");
+        const size_t nb1 = ggml_row_size(type, S), nb2 = ggml_row_size(type, row), nb3 = nb2 * n_seq_tokens;
+        ggml_tensor * q = ggml_view_4d(ctx, conv, S, H_k, n_seq_tokens, n_seqs, nb1, nb2, nb3, 0);
+        ggml_tensor * k = ggml_view_4d(ctx, conv, S, H_k, n_seq_tokens, n_seqs, nb1, nb2, nb3, ggml_row_size(type, S * H_k));
+        ggml_tensor * v = ggml_view_4d(ctx, conv, S, H_v, n_seq_tokens, n_seqs, nb1, nb2, nb3, ggml_row_size(type, 2 * S * H_k));
+
+        ggml_tensor * alpha = ggml_new_tensor_3d(ctx, type, H_v, n_seq_tokens, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, H_v, n_seq_tokens, n_seqs);
+        ggml_tensor * dt    = ggml_new_tensor_1d(ctx, type, H_v);
+        ggml_tensor * A     = ggml_new_tensor_1d(ctx, type, H_v);
+        ggml_set_name(alpha, "alpha");
+        ggml_set_name(beta,  "beta");
+        ggml_set_name(dt,    "dt");
+        ggml_set_name(A,     "A");
+
+        const float eps = 1e-6f / (float) S;
+        ggml_tensor * g;
+        if (prologue) {
+            g = ggml_reshape_4d(ctx, alpha, 1, H_v, n_seq_tokens, n_seqs);
+        } else {
+            q    = ggml_scale(ctx, ggml_rms_norm(ctx, q, eps), 1.0f / sqrtf((float) S));
+            k    = ggml_scale(ctx, ggml_rms_norm(ctx, k, eps), 1.0f / sqrtf((float) S));
+            beta = ggml_sigmoid(ctx, beta);
+            g    = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), A);
+            g    = ggml_reshape_4d(ctx, g, 1, H_v, n_seq_tokens, n_seqs);
+        }
+
+        ggml_tensor * states = ggml_new_tensor_2d(ctx, type, D, mem_size * K);
+        ggml_set_name(states, "states");
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * gdn = ggml_gated_delta_net_ids(ctx, q, k, v, g, beta, states, ids, K);
+        if (prologue) {
+            ggml_gated_delta_net_set_prologue(gdn, dt, A, eps);
+        }
+
+        const size_t tail_off = ggml_row_size(type, S * H_v * n_seq_tokens * n_seqs);
+        ggml_tensor * src = ggml_view_3d(ctx, gdn, D, n_seqs, n_written,
+                ggml_row_size(type, D), ggml_row_size(type, D * n_seqs), tail_off);
+        ggml_tensor * dst = ggml_view_3d(ctx, states, D, n_seqs, n_written,
+                states->nb[1], mem_size * states->nb[1], kv_head * states->nb[1]);
+        ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
+
+        // the written cache rows first, so the gdn, the views and the cpy stay adjacent
+        ggml_tensor * rows = ggml_reshape_1d(ctx, ggml_cont(ctx, cpy), D * n_seqs * n_written);
+        ggml_tensor * attn = ggml_view_1d(ctx, gdn, S * H_v * n_seq_tokens * n_seqs, 0);
+        return ggml_concat(ctx, rows, attn, 0);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "alpha") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else if (strcmp(t->name, "dt") == 0) {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            } else if (strcmp(t->name, "A") == 0) {
+                init_tensor_uniform(t, -2.0f, -0.05f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else if (strcmp(t->name, "states") == 0) {
+                init_tensor_uniform(t, -0.5f, 0.5f);
+            } else if (strcmp(t->name, "ids") == 0) {
+                std::vector<int32_t> data(n_seqs);
+                for (int64_t s = 0; s < n_seqs; ++s) {
+                    data[s] = (int32_t) (rollback * mem_size + kv_head + s);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, n_seqs * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_SSM_CONV_IDS (+ silu) with the conv state read through ids from a recurrent cache with rollback planes and
+// the K snapshot CPY back into the same cache (the backend may fuse the CPY and write in place: CONV_CACHE)
+struct test_ssm_conv_ids_cache : public test_case {
+    const int64_t d_inner;
+    const int64_t d_conv;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int64_t K;
+    const int64_t mem_size;
+    const int64_t kv_head;
+    const int64_t rollback;
+    const bool    silu;
+
+    std::string vars() override {
+        return VARS_TO_STR9(d_inner, d_conv, n_seq_tokens, n_seqs, K, mem_size, kv_head, rollback, silu);
+    }
+
+    test_ssm_conv_ids_cache(int64_t d_inner = 256, int64_t d_conv = 4, int64_t n_seq_tokens = 3, int64_t n_seqs = 1,
+            int64_t K = 3, int64_t mem_size = 2, int64_t kv_head = 1, int64_t rollback = 0, bool silu = true)
+        : d_inner(d_inner), d_conv(d_conv), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K), mem_size(mem_size),
+          kv_head(kv_head), rollback(rollback), silu(silu) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_IDS_CACHE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const ggml_type type = GGML_TYPE_F32;
+        const int64_t row = (d_conv - 1) * d_inner;
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, type, d_inner, n_seq_tokens, n_seqs);
+        ggml_tensor * c = ggml_new_tensor_2d(ctx, type, d_conv, d_inner);
+        ggml_set_name(x, "x");
+        ggml_set_name(c, "c");
+        ggml_tensor * states = ggml_new_tensor_2d(ctx, type, row, mem_size * K);
+        ggml_set_name(states, "states");
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * res = ggml_ssm_conv_ids(ctx, x, states, ids, c, K, silu);
+
+        ggml_tensor * src = ggml_view_3d(ctx, res, row, n_seqs, K,
+                ggml_row_size(type, row), ggml_row_size(type, row * n_seqs),
+                ggml_row_size(type, d_inner * n_seq_tokens * n_seqs));
+        ggml_tensor * dst = ggml_view_3d(ctx, states, row, n_seqs, K,
+                states->nb[1], mem_size * states->nb[1], kv_head * states->nb[1]);
+        ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
+
+        ggml_tensor * rows = ggml_reshape_1d(ctx, ggml_cont(ctx, cpy), row * n_seqs * K);
+        ggml_tensor * out  = ggml_view_1d(ctx, res, d_inner * n_seq_tokens * n_seqs, 0);
+        return ggml_concat(ctx, rows, out, 0);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "ids") == 0) {
+                std::vector<int32_t> data(n_seqs);
+                for (int64_t s = 0; s < n_seqs; ++s) {
+                    data[s] = (int32_t) (rollback * mem_size + kv_head + s);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, n_seqs * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -17634,6 +17823,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128,  4, 1, 1, false, false, /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, true,  /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32,   4, 2, 2, false, true,  /*K=*/4));
+
+    // Qwen3.5/3.6 small-ubatch delta-net layer: states read in place through ids (rollback planes), snapshots written
+    // back to the cache, optionally with the prologue in the op; and the conv with the conv state read through ids
+    for (bool pro : { false, true }) {
+        for (int64_t n_tok : { 1, 2, 3 }) {
+            for (int64_t rb : { 0, 2 }) {
+                test_cases.emplace_back(new test_qwen_gdn_ids(32, 2, 4, n_tok, 1, 3, 2, 1, rb, pro));
+            }
+            test_cases.emplace_back(new test_qwen_gdn_ids(128, 16, 32, n_tok, 1, 3, 1, 0, 1, pro)); // Qwen3.6-35B-A3B
+            test_cases.emplace_back(new test_qwen_gdn_ids(128, 16, 32, n_tok, 1, 1, 1, 0, 0, pro)); // no MTP: K = 1
+        }
+        test_cases.emplace_back(new test_qwen_gdn_ids(32, 2, 4, 3, 2, 3, 4, 1, 1, pro)); // 2 seqs: no in-place fusion
+        test_cases.emplace_back(new test_qwen_gdn_ids(32, 2, 4, 5, 1, 3, 2, 1, 0, pro)); // n_tokens > K
+        test_cases.emplace_back(new test_qwen_gdn_ids(64, 4, 4, 2, 1, 2, 2, 0, 1, pro)); // H_k == H_v
+    }
+    for (int64_t n_tok : { 1, 2, 3, 5 }) {
+        for (int64_t rb : { 0, 2 }) {
+            test_cases.emplace_back(new test_ssm_conv_ids_cache(256, 4, n_tok, 1, 3, 2, 1, rb, true));
+        }
+        test_cases.emplace_back(new test_ssm_conv_ids_cache(8192, 4, n_tok, 1, 3, 1, 0, 1, true)); // Qwen3.6-35B-A3B
+        test_cases.emplace_back(new test_ssm_conv_ids_cache(8192, 4, n_tok, 1, 1, 1, 0, 0, true)); // no MTP: K = 1
+    }
+    test_cases.emplace_back(new test_ssm_conv_ids_cache(256, 4, 3, 2, 3, 4, 1, 1, true));  // 2 seqs: no in-place fusion
+    test_cases.emplace_back(new test_ssm_conv_ids_cache(256, 4, 2, 1, 3, 2, 1, 0, false)); // no silu
+    test_cases.emplace_back(new test_ssm_conv_ids_cache(200, 3, 2, 1, 2, 2, 0, 1, true));  // d_conv 3, odd channels
 
     // gdn + cache cpy fusion (K > 1)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
