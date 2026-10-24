@@ -1,0 +1,85 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// GGML_OP_SSM_CONV_IDS: causal conv over [conv state of row ids[s] | x], optional silu, plus the K conv state
+// snapshots (slot j = window ending j tokens before the end of the batch), written to the dst tail or, fused
+// with the CPY of that tail, straight into the recurrent cache.
+// One invocation per (channel, seq): it reads its old state values before it writes any snapshot and touches
+// only its own channel, so the snapshots may overwrite the row it reads (in-place cache update).
+
+#define MAX_NCS 8
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer X     { float data_x[];     };
+layout(binding = 1) readonly  buffer C     { float data_c[];     };
+layout(binding = 2) readonly  buffer St    { float data_st[];    };
+layout(binding = 3) readonly  buffer Ids   { int   data_ids[];   };
+layout(binding = 4)           buffer Dst   { float data_d[];     };
+layout(binding = 5)           buffer Cache { float data_cache[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint x_nb1; uint x_nb2;
+    uint c_nb1;
+    uint st_nb1;
+    uint nc; uint nr; uint n_t; uint n_s;
+    uint K;
+    uint tail_off;
+    uint cache_out;
+    uint cache_seq_stride;
+    uint cache_slot_stride;
+    uint silu;
+};
+
+void main() {
+    const uint i1 = gl_GlobalInvocationID.x;
+    const uint s  = gl_WorkGroupID.y;
+    if (i1 >= nr) {
+        return;
+    }
+
+    const uint ncs = nc - 1u;
+
+    // old conv state of this channel into registers first (the snapshot writes may alias it)
+    float st[MAX_NCS];
+    const uint st_base = uint(data_ids[s]) * st_nb1 + i1 * ncs;
+    [[unroll]] for (uint i0 = 0; i0 < MAX_NCS; ++i0) {
+        st[i0] = i0 < ncs ? data_st[st_base + i0] : 0.0f;
+    }
+
+    const uint x_base = s * x_nb2 + i1;
+    const uint c_base = i1 * c_nb1;
+
+#define WIN(j) ((j) < ncs ? st[(j)] : data_x[x_base + ((j) - ncs) * x_nb1])
+
+    for (uint t = 0; t < n_t; ++t) {
+        float sum = 0.0f;
+        if (nc == 4) {
+            sum = dot(
+                vec4(WIN(t), WIN(t + 1u), WIN(t + 2u), WIN(t + 3u)),
+                vec4(data_c[c_base], data_c[c_base + 1], data_c[c_base + 2], data_c[c_base + 3])
+            );
+        } else {
+            for (uint i0 = 0; i0 < nc; ++i0) {
+                sum += WIN(t + i0) * data_c[c_base + i0];
+            }
+        }
+        if (silu != 0u) {
+            sum = sum / (1.0f + exp(-sum));
+        }
+        data_d[(s * n_t + t) * nr + i1] = sum;
+    }
+
+    for (uint j = 0; j < K; ++j) {
+        const uint start = n_t > j ? n_t - j : 0u;
+        for (uint i0 = 0; i0 < ncs; ++i0) {
+            const float v = WIN(start + i0);
+            if (cache_out != 0u) {
+                data_cache[j * cache_slot_stride + s * cache_seq_stride + i1 * ncs + i0] = v;
+            } else {
+                data_d[tail_off + (j * n_s + s) * ncs * nr + i1 * ncs + i0] = v;
+            }
+        }
+    }
+}

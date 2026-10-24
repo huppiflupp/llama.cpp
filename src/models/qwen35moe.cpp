@@ -374,53 +374,139 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
+    // Lab switches for small ubatches (decode, MTP verify) with one sequence in one cell and no state to clear or
+    // copy, i.e. when nothing but this layer touches its cache rows (the backend must support the ops):
+    //   LLAMA_LAB_CONV_IDS=1     conv state read from the cache by ids and snapshots written back by the conv op
+    //                            itself (GGML_OP_SSM_CONV_IDS: no GET_ROWS, CONCAT, separate SILU; the snapshot CPY
+    //                            is fused on Vulkan, CONV_CACHE)
+    //   LLAMA_LAB_GDN_IDS=1      SSM state read from the cache by ids (ggml_gated_delta_net_ids: no GET_ROWS; the
+    //                            snapshot CPY is fused on Vulkan, GDN_CACHE, also without MTP)
+    //   LLAMA_LAB_GDN_PROLOGUE=1 (with GDN_IDS) l2 norm of q/k, softplus(alpha + dt) * A and sigmoid(beta) inside
+    //                            the GDN op
+    static const bool lab_conv_ids = llm_lab_flag("LLAMA_LAB_CONV_IDS");
+    static const bool lab_gdn_ids  = llm_lab_flag("LLAMA_LAB_GDN_IDS");
+    static const bool lab_gdn_pro  = llm_lab_flag("LLAMA_LAB_GDN_PROLOGUE");
+    const int64_t lab_max_tokens = 16;
+
+    const bool rs_inplace = (lab_conv_ids || lab_gdn_ids) && n_seqs == 1 && n_seq_tokens <= lab_max_tokens &&
+                            mctx_cur->get_n_rs() == 1 && mctx_cur->get_rs_z() < 0;
+    ggml_backend_dev_t layer_dev = rs_inplace ? model.dev_layer(il) : nullptr;
+
     // Input projections
     auto qkvz = build_qkvz(cur, il);
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    ggml_tensor * beta  = build_lora_mm(model.layers[il].ssm_beta,  cur, model.layers[il].ssm_beta_s);
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+    ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
+    ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
 
-    ggml_build_forward_expand(gf, beta);
+    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
     ggml_build_forward_expand(gf, alpha);
 
-    beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
-    cb(beta, "beta", il);
-
-    beta = ggml_sigmoid(ctx0, beta);
-    cb(beta, "beta_sigmoid", il);
+    ggml_tensor * beta_raw = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    beta_raw = ggml_reshape_4d(ctx0, beta_raw, 1, num_v_heads, n_seq_tokens, n_seqs);
+    cb(beta_raw, "beta", il);
 
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
-    ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
-    ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
-    cb(alpha_softplus, "a_softplus", il);
+    // GDN state read in place (and with it maybe the prologue)?
+    const int64_t n_embd_s = hparams.n_embd_s();
+    ggml_tensor * ssm_rows = nullptr; // [n_embd_s, n_rows] view of the whole cache when read by ids
+    bool gdn_ids = false;
+    bool gdn_pro = false;
+    if (rs_inplace && lab_gdn_ids && layer_dev != nullptr && ssm_states_all->type == GGML_TYPE_F32) {
+        ssm_rows = ggml_reshape_2d(ctx0, ssm_states_all, n_embd_s, ggml_nelements(ssm_states_all) / n_embd_s);
+        // probe with stand-ins of the real shapes (the real q/k/v are views of the conv output)
+        ggml_tensor * pq = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+        ggml_tensor * pv = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+        ggml_tensor * pg = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, num_v_heads, n_seq_tokens, n_seqs);
+        ggml_tensor * probe = ggml_gated_delta_net_ids(ctx0, pq, pq, pv, pg, beta_raw, ssm_rows, inp->s_copy_main,
+                                                       cparams.n_rs_seq + 1);
+        gdn_ids = ggml_backend_dev_supports_op(layer_dev, probe);
+        if (gdn_ids && lab_gdn_pro && model.layers[il].ssm_dt->type == GGML_TYPE_F32 &&
+                model.layers[il].ssm_a->type == GGML_TYPE_F32) {
+            ggml_gated_delta_net_set_prologue(probe, model.layers[il].ssm_dt, model.layers[il].ssm_a, 0.0f);
+            gdn_pro = ggml_backend_dev_supports_op(layer_dev, probe);
+        }
+    }
 
-    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
-    cb(gate, "gate", il);
+    ggml_tensor * beta = beta_raw;
+    ggml_tensor * gate = nullptr;
+    if (gdn_pro) {
+        gate = ggml_reshape_4d(ctx0, alpha, 1, num_v_heads, n_seq_tokens, n_seqs); // raw, the op does the rest
+    } else {
+        beta = ggml_sigmoid(ctx0, beta_raw);
+        cb(beta, "beta_sigmoid", il);
 
-    gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+        ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
+        ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
+        cb(alpha_softplus, "a_softplus", il);
 
-    ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
-    ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
+        gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
+        cb(gate, "gate", il);
+
+        gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+    }
 
     ggml_tensor * conv_kernel      = model.layers[il].ssm_conv1d;
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+    // conv state read in place?
+    const int64_t conv_row_count = (conv_kernel_size - 1) * conv_channels;
+    ggml_tensor * conv_rows = nullptr;
+    if (rs_inplace && lab_conv_ids && layer_dev != nullptr && conv_states_all->type == GGML_TYPE_F32 &&
+            conv_kernel->type == GGML_TYPE_F32 && qkv_mixed->type == GGML_TYPE_F32 &&
+            conv_states_all->nb[1] == ggml_row_size(GGML_TYPE_F32, conv_row_count)) {
+        conv_rows = ggml_reshape_2d(ctx0, conv_states_all, conv_row_count, ggml_nelements(conv_states_all) / conv_row_count);
+        ggml_tensor * probe = ggml_ssm_conv_ids(ctx0, qkv_mixed, conv_rows, inp->s_copy_main, conv_kernel,
+                                                cparams.n_rs_seq + 1, true);
+        if (!ggml_backend_dev_supports_op(layer_dev, probe)) {
+            conv_rows = nullptr;
+        }
+    }
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs, nullptr, /*allow_inplace=*/true);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
+    ggml_tensor * conv_output_silu = nullptr;
+    if (conv_rows != nullptr) {
+        // conv output and the K conv state snapshots in one op; the snapshots go to the rollback groups like in
+        // build_conv_state (slot j -> group j at kv_head)
+        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+        const auto    kv_head  = mctx_cur->get_head();
+        const auto    mem_size = mctx_cur->get_size();
+        const size_t  row_size = ggml_row_size(GGML_TYPE_F32, conv_row_count);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-    cb(conv_output_proper, "conv_output_raw", il);
+        ggml_tensor * conv_res = ggml_ssm_conv_ids(ctx0, qkv_mixed, conv_rows, inp->s_copy_main, conv_kernel, K, true);
+        cb(conv_res, "conv_ids", il);
 
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+        conv_output_silu = ggml_view_3d(ctx0, conv_res, conv_channels, n_seq_tokens, n_seqs,
+                ggml_row_size(conv_res->type, conv_channels),
+                ggml_row_size(conv_res->type, conv_channels * n_seq_tokens), 0);
+
+        ggml_tensor * snaps = ggml_view_3d(ctx0, conv_res, conv_row_count, n_seqs, K,
+                row_size, row_size * n_seqs,
+                ggml_row_size(conv_res->type, conv_channels * n_seq_tokens * n_seqs));
+        ggml_tensor * dst = ggml_view_3d(ctx0, conv_states_all, conv_row_count, n_seqs, K,
+                conv_states_all->nb[1], (size_t) mem_size * row_size, (size_t) kv_head * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, snaps, dst));
+    } else {
+        ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+
+        ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
+
+        conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+    }
     cb(conv_output_silu, "conv_output_silu", il);
+
+    ggml_tensor * state = nullptr;
+    if (gdn_ids) {
+        state = ssm_rows;
+    } else {
+        state = build_rs(inp, ssm_states_all, n_embd_s, n_seqs, nullptr, /*allow_inplace=*/true);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        cb(state, "state_predelta", il);
+    }
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
 
@@ -454,8 +540,10 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    if (!gdn_pro) {
+        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    }
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
@@ -473,7 +561,11 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    ggml_tensor * output = gdn_ids ?
+        build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il, inp->s_copy_main,
+                gdn_pro ? model.layers[il].ssm_dt : nullptr, gdn_pro ? model.layers[il].ssm_a : nullptr,
+                eps_norm / (float) head_k_dim) :
+        build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

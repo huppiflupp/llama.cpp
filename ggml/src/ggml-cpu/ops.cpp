@@ -10043,6 +10043,27 @@ void ggml_compute_forward_flash_attn_back(
 
 // ggml_compute_forward_ssm_conv
 
+// rows ir of one token of ggml_ssm_conv: s = window start of the first row (row stride ncs), c = its kernel row.
+// Shared by SSM_CONV and SSM_CONV_IDS (not inlined, so that both compute the very same f32 sums).
+#if defined(_MSC_VER)
+#define GGML_SSM_CONV_NOINLINE __declspec(noinline)
+#else
+#define GGML_SSM_CONV_NOINLINE __attribute__((noinline))
+#endif
+static GGML_SSM_CONV_NOINLINE void ggml_ssm_conv_rows_f32(const float * s, const float * c, float * x, int ir, int ncs, int nc) {
+    for (int i1 = 0; i1 < ir; ++i1) {
+        // rowwise dot product
+        // NOTE: not using ggml_vec_dot_f32, because its sum is in double precision
+        float sumf = 0.0f;
+
+        // d_conv
+        for (int i0 = 0; i0 < nc; ++i0) {
+            sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
+        }
+        x[i1] = sumf;
+    }
+}
+
 static void ggml_compute_forward_ssm_conv_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -10081,17 +10102,7 @@ static void ggml_compute_forward_ssm_conv_f32(
 
             // TODO: transpose the output for smaller strides for big batches?
             // d_inner
-            for (int i1 = 0; i1 < ir; ++i1) {
-                // rowwise dot product
-                // NOTE: not using ggml_vec_dot_f32, because its sum is in double precision
-                float sumf = 0.0f;
-
-                // d_conv
-                for (int i0 = 0; i0 < nc; ++i0) {
-                    sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
-                }
-                x[i1] = sumf;
-            }
+            ggml_ssm_conv_rows_f32(s, c, x, ir, ncs, nc);
         }
     }
 }
@@ -10103,6 +10114,108 @@ void ggml_compute_forward_ssm_conv(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_ssm_conv_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_ssm_conv_ids
+
+static void ggml_compute_forward_ssm_conv_ids_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src_x  = dst->src[0]; // [d_inner, n_t, n_s]
+    const ggml_tensor * src_c  = dst->src[1]; // [d_conv, d_inner]
+    const ggml_tensor * src_st = dst->src[2]; // [(d_conv-1)*d_inner, n_rows]
+    const ggml_tensor * src_id = dst->src[3]; // I32 [n_s]
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nc   = src_c->ne[0];        // d_conv
+    const int64_t ncs  = nc - 1;              // conv state length
+    const int64_t nr   = src_c->ne[1];        // d_inner
+    const int64_t n_t  = src_x->ne[1];
+    const int64_t n_s  = src_x->ne[2];
+    const int64_t K    = ggml_get_op_params_i32(dst, 0);
+    const bool    silu = ggml_get_op_params_i32(dst, 1) != 0;
+
+    GGML_ASSERT(src_x->nb[0] == sizeof(float) && src_c->nb[0] == sizeof(float) && src_st->nb[0] == sizeof(float));
+
+    const int32_t * ids = (const int32_t *) src_id->data;
+
+    // element j of the conv window of seq s, channel i1: j < ncs from the old state, else token j - ncs
+    auto window = [&](int64_t s, int64_t i1, int64_t j) -> float {
+        if (j < ncs) {
+            const float * st = (const float *) ((const char *) src_st->data + (int64_t) ids[s]*src_st->nb[1]);
+            return st[i1*ncs + j];
+        }
+        return *(const float *) ((const char *) src_x->data + (j - ncs)*src_x->nb[1] + s*src_x->nb[2] + i1*src_x->nb[0]);
+    };
+
+    float * out = (float *) dst->data;
+
+    // conv output: the window [state | x] of the thread's channels is gathered into scratch in the layout of the
+    // concat that SSM_CONV reads ({ncs + n_t, d_inner}), then the same row kernel runs -> same f32 sums
+    const int64_t nw  = ncs + n_t;
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ic0 = MIN(dr*ith, nr);
+    const int64_t ic1 = MIN(ic0 + dr, nr);
+    float * win = (float *) params->wdata + ith*(dr*nw + CACHE_LINE_SIZE_F32);
+    GGML_ASSERT(src_c->nb[1] == nc*sizeof(float));
+    for (int64_t s = 0; s < n_s; ++s) {
+        for (int64_t i1 = ic0; i1 < ic1; ++i1) {
+            for (int64_t j = 0; j < nw; ++j) {
+                win[(i1 - ic0)*nw + j] = window(s, i1, j);
+            }
+        }
+        for (int64_t t = 0; t < n_t && ic1 > ic0; ++t) {
+            ggml_ssm_conv_rows_f32(win + t, (const float *) src_c->data + ic0*nc, out + (s*n_t + t)*nr + ic0,
+                                   (int) (ic1 - ic0), (int) nw, (int) nc);
+        }
+    }
+
+    if (silu) {
+        // after all channels: silu per output row, as the separate SILU op does
+        ggml_barrier(params->threadpool);
+        const int64_t n_rows = n_t*n_s;
+        const int64_t drr = (n_rows + nth - 1)/nth;
+        const int64_t ir0 = drr*ith;
+        const int64_t ir1 = MIN(ir0 + drr, n_rows);
+        for (int64_t ir = ir0; ir < ir1; ++ir) {
+            ggml_vec_silu_f32((int) nr, out + ir*nr, out + ir*nr);
+        }
+    }
+
+    // snapshots: slot j = the ncs window entries starting at max(0, n_t - j) of [state | x]
+    float * tail = out + n_t*n_s*nr;
+    const int64_t n_blocks = K*n_s;
+    const int64_t db  = (n_blocks + nth - 1)/nth;
+    const int64_t ib0 = db*ith;
+    const int64_t ib1 = MIN(ib0 + db, n_blocks);
+    for (int64_t ib = ib0; ib < ib1; ++ib) {
+        const int64_t j = ib / n_s;
+        const int64_t s = ib % n_s;
+        const int64_t start = std::max<int64_t>(0, n_t - j);
+        float * y = tail + ib*ncs*nr;
+        for (int64_t i1 = 0; i1 < nr; ++i1) {
+            for (int64_t i0 = 0; i0 < ncs; ++i0) {
+                y[i1*ncs + i0] = window(s, i1, start + i0);
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_ssm_conv_ids(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_ssm_conv_ids_f32(params, dst);
             } break;
         default:
             {
@@ -11247,6 +11360,13 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     ggml_tensor * src_g     = dst->src[3];
     ggml_tensor * src_beta  = dst->src[4];
     ggml_tensor * src_state = dst->src[5];
+    ggml_tensor * src_ids   = dst->src[6]; // optional: the state of seq s is row ids[s] of src_state
+
+    // optional prologue (ggml_gated_delta_net_set_prologue): q, k, g and beta are the raw inputs
+    const bool    prologue  = ggml_get_op_params_i32(dst, 1) != 0;
+    const float   l2_eps    = prologue ? ggml_get_op_params_f32(dst, 2) : 0.0f;
+    const float * dt_bias   = prologue ? (const float *) dst->src[7]->data : nullptr;
+    const float * A_log_neg = prologue ? (const float *) dst->src[8]->data : nullptr;
 
     const int64_t S_v      = src_v->ne[0];
     const int64_t H        = src_v->ne[1];
@@ -11258,7 +11378,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
     GGML_ASSERT(ggml_is_contiguous(src_g));
     GGML_ASSERT(ggml_is_contiguous(src_beta));
-    GGML_ASSERT(ggml_is_contiguous(src_state));
+    GGML_ASSERT(src_ids ? ggml_is_contiguous_rows(src_state) : ggml_is_contiguous(src_state));
+    GGML_ASSERT(!prologue || src_ids != nullptr);
 
     GGML_ASSERT(src_g->ne[0] == 1 || src_g->ne[0] == S_v);
     GGML_ASSERT(src_beta->ne[0] == 1);
@@ -11278,14 +11399,15 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int64_t K = ggml_get_op_params_i32(dst, 0);
     GGML_ASSERT(K >= 1);
-    // per-seq stride in floats (seq s starts at state + s * seq_stride)
-    const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
+    // per-seq stride in floats (seq s starts at state + s * seq_stride); with ids, the row stride of the states
+    const int64_t state_seq_stride = (src_ids ? src_state->nb[1] : src_state->nb[3]) / sizeof(float);
 
-    const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+    const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0) + (prologue ? 2 * S_v : 0);
     const int ith = params->ith;
 
     float * delta       = (float *)params->wdata + ith * per_thread + CACHE_LINE_SIZE_F32;
     float * state_work  = K > 1 ? (delta + S_v) : nullptr;
+    float * qk_norm     = prologue ? (delta + S_v + (K > 1 ? S_v * S_v : 0)) : nullptr; // [q | k] normalized
 
     // output layout: [attn_scores | new_states]
     // attn_scores: S_v * H * n_tokens * n_seqs    floats
@@ -11325,7 +11447,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
         // copy input state into the working buffer and operate in-place
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
-        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+        const int64_t i_state = src_ids ? (int64_t) ((const int32_t *) src_ids->data)[iv3] : iv3;
+        const float * s_in = state_in_base + i_state * state_seq_stride + iv1 * S_v * S_v;
         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
 
         // attn output pointer for first token of this (head, seq)
@@ -11336,8 +11459,38 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
             const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);
 
-            const float beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
-            const float * g_d    =  (const float *)((const char *)src_g->data    + iv3 * nbg3 + t * nbg2 + iv1 * nbg1);
+            float beta_val    = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
+            const float * g_d =  (const float *)((const char *)src_g->data    + iv3 * nbg3 + t * nbg2 + iv1 * nbg1);
+
+            float g_pro = 0.0f;
+            if (prologue) {
+                // same f32 operations as the unfused graph: scale(rms_norm(x, l2_eps), 1/sqrt(S_k)) for q and k,
+                // sigmoid(beta), softplus(g + dt_bias) * A
+                const float l2_scale = 1.0f/sqrtf((float) S_v);
+                const float * src_qk[2] = { q_d, k_d };
+                for (int j = 0; j < 2; ++j) {
+                    const float * x = src_qk[j];
+                    float       * y = qk_norm + j * S_v;
+                    ggml_float sum = 0.0;
+                    for (int64_t i = 0; i < S_v; ++i) {
+                        sum += (ggml_float)(x[i] * x[i]);
+                    }
+                    const float mean  = sum/S_v;
+                    const float scale = 1.0f/sqrtf(mean + l2_eps);
+                    for (int64_t i = 0; i < S_v; ++i) {
+                        y[i] = (x[i] * scale) * l2_scale;
+                    }
+                }
+                q_d = qk_norm;
+                k_d = qk_norm + S_v;
+
+                beta_val = 1.f / (1.f + expf(-beta_val));
+
+                const float a  = g_d[0] + dt_bias[iv1];
+                const float sp = (a > 20.0f) ? a : logf(1.0f + expf(a));
+                g_pro = sp * A_log_neg[iv1];
+                g_d   = &g_pro;
+            }
 
             // state is stored transposed: s_out[j*S_v + i] = S[i][j]
             // so row j of s_out = column j of S (contiguous access)

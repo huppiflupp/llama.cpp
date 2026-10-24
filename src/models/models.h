@@ -19,6 +19,12 @@ static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * 
     return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
 }
 
+// lab switches of the graph (environment, read once): set and != 0
+static inline bool llm_lab_flag(const char * name) {
+    const char * v = getenv(name);
+    return v != nullptr && atoi(v) != 0;
+}
+
 //
 // base classes
 //
@@ -90,6 +96,11 @@ struct llm_build_delta_net_base : public llm_graph_context {
 
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
+    // with s_ids, s is the 2D view of the whole cache [S_v*S_v*H_v, n_rows] and the initial state of seq i is row
+    // s_ids[i] (ggml_gated_delta_net_ids, read in place); the snapshots then always go through the fused-friendly
+    // [D, n_seqs, n_written] view CPY, also without rollback snapshots (K = 1).
+    // With pro_dt/pro_a (only with s_ids), q, k, g and b are raw and the op computes the Qwen prologue itself
+    // (ggml_gated_delta_net_set_prologue).
     ggml_tensor * build_recurrent_attn(
             llm_graph_input_rs * inp,
             ggml_tensor *        ssm_states_all,
@@ -99,7 +110,11 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        g,
             ggml_tensor *        b,
             ggml_tensor *        s,
-            int                  il);
+            int                  il,
+            ggml_tensor *        s_ids      = nullptr,
+            ggml_tensor *        pro_dt     = nullptr,
+            ggml_tensor *        pro_a      = nullptr,
+            float                pro_l2_eps = 0.0f);
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {

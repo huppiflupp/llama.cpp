@@ -8,6 +8,9 @@
 #if USE_SUBGROUP_ADD
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #endif
+#if USE_SUBGROUP_SHUFFLE
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#endif
 
 // Caller guarantees valid spec constants: S_V % COLS_PER_WG == 0 and S_V % LANES_PER_COLUMN == 0,
 // so no bounds checking is needed.
@@ -35,6 +38,12 @@ layout(push_constant) uniform Parameters {
     uint cache_out;         // write the snapshots straight into the recurrent cache (fused GDN -> CPY)
     uint cache_seq_stride;  // floats between the cache rows of two seqs
     uint cache_slot_stride; // floats between two snapshot slots in the cache
+    uint state_seq_stride;  // floats between the initial states of two seqs (rows of the state buffer with ids)
+    uint use_ids;           // initial state of seq s is row ids[s] (ggml_gated_delta_net_ids)
+    uint prologue;          // q, k, g, beta are raw: l2-norm q/k, softplus(g + dt) * A, sigmoid(beta) in here
+    float l2_eps;           // eps of the q/k rms_norm (already divided by S_k)
+    float l2_scale;         // the scale after the q/k rms_norm (1/sqrt(S_k), as computed by the graph)
+    uint l2_cols;          // S_k (runtime, for the rms_norm mean)
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -45,6 +54,9 @@ layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
 layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
 layout(binding = 7)           buffer CacheBuf { FLOAT_TYPE data_cache[]; };
+layout(binding = 8) readonly  buffer IdsBuf   { int        data_ids[];   };
+layout(binding = 9) readonly  buffer DtBuf    { FLOAT_TYPE data_dt[];    };
+layout(binding = 10) readonly buffer ABuf     { FLOAT_TYPE data_a[];     };
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
 shared FLOAT_TYPE temp[SUBGROUP_SIZE];
@@ -96,6 +108,34 @@ FLOAT_TYPE reduce_partial(FLOAT_TYPE partial) {
     }
 }
 
+// sum of squares of a vector spread over a lane group (element r * LANES_PER_COLUMN + lane in v[r]) for the prologue's
+// l2 norm. With subgroup shuffles the additions follow the tree of rms_norm.comp (BLOCK_SIZE >= S_V: stride S_V/2,
+// S_V/4, ... 1 over the element index), so the result is bit-identical to the separate RMS_NORM(_SCALE) dispatch.
+FLOAT_TYPE sum_sq(const FLOAT_TYPE v[ROWS_PER_LANE]) {
+#if USE_SUBGROUP_SHUFFLE
+    precise FLOAT_TYPE p[ROWS_PER_LANE];
+    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+        p[r] = v[r] * v[r];
+    }
+    [[unroll]] for (uint s = ROWS_PER_LANE / 2u; s > 0u; s >>= 1u) {
+        [[unroll]] for (uint r = 0; r < s; r++) {
+            p[r] = p[r] + p[r + s];
+        }
+    }
+    precise FLOAT_TYPE sum = p[0];
+    [[unroll]] for (uint s = LANES_PER_COLUMN / 2u; s > 0u; s >>= 1u) {
+        sum = sum + subgroupShuffleXor(sum, s);
+    }
+    return sum;
+#else
+    FLOAT_TYPE sum = 0.0;
+    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+        sum += v[r] * v[r];
+    }
+    return reduce_partial(sum);
+#endif
+}
+
 void main() {
     const uint head_id = gl_WorkGroupID.x;
     const uint seq_id = gl_WorkGroupID.y;
@@ -106,8 +146,11 @@ void main() {
     const uint iq3 = seq_id / rq3;
 
     const uint state_size = S_V * S_V;
-    // input state holds s0 only [S_v, S_v, H, n_seqs]: per-seq stride is H*D.
-    const uint state_in_base       = (seq_id * H + head_id) * state_size;
+    // input state holds s0 only [S_v, S_v, H, n_seqs] (per-seq stride state_seq_stride), or, with ids, the
+    // state of seq s is row ids[s]. Each invocation reads its state shard before it writes any snapshot, and the
+    // shards of different invocations are disjoint, so the snapshots may overwrite the rows that were read.
+    const uint state_row           = use_ids != 0u ? uint(data_ids[seq_id]) : seq_id;
+    const uint state_in_base       = state_row * state_seq_stride + head_id * state_size;
     // output state layout per slot: same per-(seq,head) offset as the single-slot case.
     const uint state_out_base      = (seq_id * H + head_id) * state_size;
     const uint state_size_per_snap = state_size * H * n_seqs;
@@ -127,7 +170,7 @@ void main() {
         const uint k_off = q_off;
         const uint v_off = seq_id * sv3 + t * sv2 + head_id * sv1;
         const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
-        const FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
+        FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
 
         FLOAT_TYPE k_reg[ROWS_PER_LANE];
         FLOAT_TYPE q_reg[ROWS_PER_LANE];
@@ -137,9 +180,33 @@ void main() {
             q_reg[r] = FLOAT_TYPE(data_q[q_off + i]);
         }
 
+        FLOAT_TYPE g_raw = FLOAT_TYPE(0.0);
+        if (KDA == 0) {
+            g_raw = FLOAT_TYPE(data_g[gb_off]);
+        }
+
+        if (prologue != 0u) {
+            // the ops of the unfused graph: scale(rms_norm(x, l2_eps), 1/sqrt(S_v)) for q and k (each lane group
+            // holds the whole vector), sigmoid(beta), softplus(g + dt) * A
+            const FLOAT_TYPE kk = sum_sq(k_reg);
+            const FLOAT_TYPE qq = sum_sq(q_reg);
+            // mean as in rms_norm.comp: a division by the runtime column count (not a constant-folded multiply)
+            const FLOAT_TYPE k_scale = inversesqrt(kk / FLOAT_TYPE(l2_cols) + FLOAT_TYPE(l2_eps));
+            const FLOAT_TYPE q_scale = inversesqrt(qq / FLOAT_TYPE(l2_cols) + FLOAT_TYPE(l2_eps));
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                k_reg[r] = (k_scale * k_reg[r]) * FLOAT_TYPE(l2_scale);
+                q_reg[r] = (q_scale * q_reg[r]) * FLOAT_TYPE(l2_scale);
+            }
+
+            beta_val = FLOAT_TYPE(1.0) / (FLOAT_TYPE(1.0) + exp(-beta_val));
+
+            const FLOAT_TYPE a = g_raw + FLOAT_TYPE(data_dt[head_id]);
+            g_raw = ((a > FLOAT_TYPE(20.0)) ? a : log(FLOAT_TYPE(1.0) + exp(a))) * FLOAT_TYPE(data_a[head_id]);
+        }
+
         FLOAT_TYPE g_exp[ROWS_PER_LANE];
         if (KDA == 0) {
-            const FLOAT_TYPE g_val = exp(FLOAT_TYPE(data_g[gb_off]));
+            const FLOAT_TYPE g_val = exp(g_raw);
             [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
                 g_exp[r] = g_val;
             }

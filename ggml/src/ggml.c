@@ -1203,6 +1203,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "SSM_CONV_IDS",
 
     "UNARY",
 
@@ -1224,7 +1225,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "EXL3_MUL_MAT_ID",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1322,6 +1323,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "ssm_conv_ids(x, states, ids, c)",
 
     "unary(x)",
 
@@ -1343,7 +1345,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "exl3(X)[ids]*y",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5869,6 +5871,46 @@ struct ggml_tensor * ggml_ssm_conv(
     return result;
 }
 
+// ggml_ssm_conv_ids
+
+struct ggml_tensor * ggml_ssm_conv_ids(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * states,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * c,
+        int64_t               K,
+        bool                  silu) {
+    GGML_ASSERT(ggml_is_matrix(c));
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = x->ne[1];
+    const int64_t n_s     = x->ne[2];
+
+    GGML_ASSERT(d_conv >= 2);
+    GGML_ASSERT(x->ne[0] == d_inner && x->ne[3] == 1);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && c->type == GGML_TYPE_F32 && states->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && c->nb[0] == sizeof(float));
+    GGML_ASSERT(states->ne[0] == (d_conv - 1)*d_inner && ggml_is_contiguous_rows(states));
+    GGML_ASSERT(states->ne[2] == 1 && states->ne[3] == 1);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_vector(ids) && ids->ne[0] == n_s);
+    GGML_ASSERT(K >= 1 && n_t >= 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_inner, n_t*n_s + K*(d_conv - 1)*n_s);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) K);
+    ggml_set_op_params_i32(result, 1, silu ? 1 : 0);
+
+    result->op     = GGML_OP_SSM_CONV_IDS;
+    result->src[0] = x;
+    result->src[1] = c;
+    result->src[2] = states;
+    result->src[3] = ids;
+
+    return result;
+}
+
 // ggml_ssm_scan
 
 struct ggml_tensor * ggml_ssm_scan(
@@ -6603,6 +6645,74 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[5] = state;
 
     return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_ids(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * states,
+        struct ggml_tensor  * ids,
+        int64_t               K) {
+    const int64_t S_v    = v->ne[0];
+    const int64_t H      = v->ne[1];
+    const int64_t n_seqs = v->ne[3];
+
+    GGML_ASSERT(states->type == GGML_TYPE_F32);
+    GGML_ASSERT(states->ne[0] == S_v*S_v*H);
+    GGML_ASSERT(ggml_is_contiguous_rows(states) && states->ne[2] == 1 && states->ne[3] == 1);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_vector(ids) && ids->ne[0] == n_seqs);
+
+    GGML_ASSERT(ggml_is_contiguous_rows(q) && ggml_is_contiguous_rows(k) && ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g) && ggml_is_contiguous(beta));
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
+    GGML_ASSERT(beta->ne[0] == 1);
+    GGML_ASSERT(K >= 1);
+
+    const int64_t n_tokens   = v->ne[2];
+    const int64_t state_rows = K * S_v * n_seqs;
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) K);
+
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = states;
+    result->src[6] = ids;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_set_prologue(
+        struct ggml_tensor  * gdn,
+        struct ggml_tensor  * dt_bias,
+        struct ggml_tensor  * A,
+        float                 l2_eps) {
+    GGML_ASSERT(gdn->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(gdn->src[6] != NULL); // only with ids: backends check src[6] for the extended op
+    const int64_t H = gdn->src[2]->ne[1];
+    GGML_ASSERT(gdn->src[3]->ne[0] == 1); // scalar gate
+    GGML_ASSERT(dt_bias->type == GGML_TYPE_F32 && ggml_is_contiguous(dt_bias) && ggml_nelements(dt_bias) == H);
+    GGML_ASSERT(A->type       == GGML_TYPE_F32 && ggml_is_contiguous(A)       && ggml_nelements(A)       == H);
+    GGML_ASSERT(l2_eps >= 0.0f);
+
+    ggml_set_op_params_i32(gdn, 1, 1);
+    ggml_set_op_params_f32(gdn, 2, l2_eps);
+    gdn->src[7] = dt_bias;
+    gdn->src[8] = A;
+
+    return gdn;
 }
 
 // ggml_lightning_indexer

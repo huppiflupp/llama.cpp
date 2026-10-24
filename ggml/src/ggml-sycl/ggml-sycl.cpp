@@ -7148,7 +7148,9 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
         case GGML_OP_GATED_LINEAR_ATTN:
+            return true;
         case GGML_OP_GATED_DELTA_NET:
+            return op->src[6] == nullptr; // no state ids (ggml_gated_delta_net_ids)
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             return true;

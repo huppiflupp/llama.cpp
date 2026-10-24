@@ -1035,6 +1035,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_RWKV_WKV6:
             case GGML_OP_GATED_LINEAR_ATTN:
             case GGML_OP_RWKV_WKV7:
+            case GGML_OP_SSM_CONV_IDS:
             case GGML_OP_SOLVE_TRI: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;

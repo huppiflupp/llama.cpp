@@ -2329,6 +2329,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_ssm_conv(params, tensor);
             } break;
+        case GGML_OP_SSM_CONV_IDS:
+            {
+                ggml_compute_forward_ssm_conv_ids(params, tensor);
+            } break;
         case GGML_OP_SSM_SCAN:
             {
                 ggml_compute_forward_ssm_scan(params, tensor);
@@ -2740,6 +2744,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
+        case GGML_OP_SSM_CONV_IDS:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
             {
@@ -3344,11 +3349,20 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
                     } break;
+                case GGML_OP_SSM_CONV_IDS:
+                    {
+                        // per thread: the conv windows of its channels, see ggml_compute_forward_ssm_conv_ids_f32
+                        const int64_t nr = node->src[1]->ne[1];
+                        const int64_t nw = node->src[1]->ne[0] - 1 + node->src[0]->ne[1];
+                        const int64_t dr = (nr + n_tasks - 1)/n_tasks;
+                        cur = sizeof(float)*(dr*nw + CACHE_LINE_SIZE_F32)*n_tasks;
+                    } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {
                         const int64_t S_v = node->src[2]->ne[0];
                         const int64_t K   = ggml_get_op_params_i32(node, 0);
-                        const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+                        const bool    prologue = ggml_get_op_params_i32(node, 1) != 0;
+                        const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0) + (prologue ? 2 * S_v : 0);
                         cur = per_thread * sizeof(float) * n_tasks;
                     } break;
                 case GGML_OP_COUNT:

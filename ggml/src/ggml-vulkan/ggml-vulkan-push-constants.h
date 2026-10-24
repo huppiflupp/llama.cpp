@@ -1,4 +1,7 @@
 #pragma once
+
+#include <cstddef>
+#include <cstring>
 #include "ggml-vulkan-types.h"
 
 uint32_t get_misalign_bytes(const ggml_backend_vk_context * ctx, const ggml_tensor * t);
@@ -820,11 +823,39 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t cache_out;         // write the snapshots straight into the recurrent cache (fused GDN -> CPY)
     uint32_t cache_seq_stride;  // floats between the cache rows of two seqs
     uint32_t cache_slot_stride; // floats between two snapshot slots in the cache
+    uint32_t state_seq_stride;  // floats between the initial states of two seqs (or two rows, with ids)
+    uint32_t use_ids;           // initial state of seq s is row ids[s] of the state buffer
+    uint32_t prologue;          // ggml_gated_delta_net_set_prologue
+    float    l2_eps;
+    float    l2_scale;
+    uint32_t l2_cols;
 };
+static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);
 
 // gdn_chunk_prep.comp / gdn_chunk_scan.comp: the sequential kernel's constants plus the chunk count
+// the leading fields of vk_op_gated_delta_net_push_constants that the chunk shaders read (up to K)
+struct vk_op_gdn_chunk_base_push_constants {
+    uint32_t H;
+    uint32_t n_tokens;
+    uint32_t n_seqs;
+    uint32_t s_off;
+    uint32_t sq1, sq2, sq3;
+    uint32_t sv1, sv2, sv3;
+    uint32_t sb1, sb2, sb3;
+    uint32_t neq1, rq3;
+    float scale;
+    uint32_t K;
+};
+static_assert(offsetof(vk_op_gated_delta_net_push_constants, cache_out) == sizeof(vk_op_gdn_chunk_base_push_constants));
+
+static inline vk_op_gdn_chunk_base_push_constants vk_gdn_chunk_base(const vk_op_gated_delta_net_push_constants & pc) {
+    vk_op_gdn_chunk_base_push_constants b;
+    memcpy(&b, &pc, sizeof(b));
+    return b;
+}
+
 struct vk_op_gdn_chunk_push_constants {
-    vk_op_gated_delta_net_push_constants gdn;
+    vk_op_gdn_chunk_base_push_constants gdn;
     uint32_t nch;
     uint32_t qk_norm;   // prep: q and k are the raw views, l2-normalised on load (x * qk_mul * rsqrt(mean(x^2) + qk_eps))
     float    qk_eps;
@@ -851,6 +882,20 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nb11;
     uint32_t dst_nb0, dst_nb1, dst_nb2;
     uint32_t nc, ncs, nr, n_t, n_s;
+};
+
+// GGML_OP_SSM_CONV_IDS (strides in floats)
+struct vk_op_ssm_conv_ids_push_constants {
+    uint32_t x_nb1, x_nb2;      // x [d_inner, n_t, n_s]
+    uint32_t c_nb1;             // c [d_conv, d_inner]
+    uint32_t st_nb1;            // states [(d_conv-1)*d_inner, n_rows]
+    uint32_t nc, nr, n_t, n_s;  // d_conv, d_inner
+    uint32_t K;
+    uint32_t tail_off;          // first snapshot float in dst
+    uint32_t cache_out;         // write the snapshots straight into the recurrent cache (fused CPY)
+    uint32_t cache_seq_stride;  // floats between the cache rows of two seqs
+    uint32_t cache_slot_stride; // floats between two snapshot slots in the cache
+    uint32_t silu;
 };
 
 struct vk_op_conv2d_push_constants {

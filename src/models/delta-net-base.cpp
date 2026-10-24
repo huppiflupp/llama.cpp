@@ -530,17 +530,24 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor *        g,
         ggml_tensor *        b,
         ggml_tensor *        s,
-        int                  il) {
+        int                  il,
+        ggml_tensor *        s_ids,
+        ggml_tensor *        pro_dt,
+        ggml_tensor *        pro_a,
+        float                pro_l2_eps) {
     const auto * mctx_cur   = inp->mctx;
     const auto   kv_head    = mctx_cur->get_head();
     const uint32_t mem_size = mctx_cur->get_size();
 
-    const int64_t S_v          = s->ne[0];
-    const int64_t H_v          = s->ne[2];
-    const int64_t n_seqs       = s->ne[3];
+    const int64_t S_v          = v->ne[0];
+    const int64_t H_v          = v->ne[1];
+    const int64_t n_seqs       = v->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
-    const bool keep = cparams.n_rs_seq > 0;
+    GGML_ASSERT(s_ids != nullptr || pro_dt == nullptr);
+
+    // with ids the snapshot path below also serves K == 1
+    const bool keep = cparams.n_rs_seq > 0 || s_ids != nullptr;
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
@@ -560,8 +567,13 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
-    // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    // state s is 4D [S_v, S_v, H_v, n_seqs] (or the cache rows read through s_ids); K snapshot slots are written
+    // into the output.
+    ggml_tensor * gdn_out = s_ids ? ggml_gated_delta_net_ids(ctx0, q, k, v, g, b, s, s_ids, K)
+                                  : ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    if (pro_dt != nullptr) {
+        ggml_gated_delta_net_set_prologue(gdn_out, pro_dt, pro_a, pro_l2_eps);
+    }
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {

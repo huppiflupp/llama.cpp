@@ -1648,6 +1648,9 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
         //     // CVS-186471
         //     return true;
         // }
+        if (op->src[6] != nullptr) {
+            return {false, "GATED_DELTA_NET with state ids is not supported"};
+        }
         if (op->src[2]->op == GGML_OP_PERMUTE) {
             return {false, "GATED_DELTA_NET with PERMUTE src2 is not supported"};
         }

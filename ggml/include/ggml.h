@@ -632,6 +632,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_SSM_CONV_IDS,
 
         GGML_OP_UNARY,
 
@@ -2601,6 +2602,27 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // short causal conv of a recurrent layer with the conv state read from (and, through a CPY of the tail, written
+    // back to) a recurrent cache:
+    //   x      : [d_inner, n_t, n_s]              new inputs (not transposed)
+    //   states : [(d_conv-1)*d_inner, n_rows]     cache rows, row ids[s] holds the conv state of seq s
+    //                                             ([d_conv-1, d_inner], time fastest, as for ggml_ssm_conv)
+    //   ids    : I32 [n_s]
+    //   c      : [d_conv, d_inner]
+    // result: [d_inner, n_t*n_s + K*(d_conv-1)*n_s]: the conv output [d_inner, n_t, n_s] (silu applied if silu),
+    // followed by K state snapshots of (d_conv-1)*d_inner floats each, slot-major then seq ([d_conv-1, d_inner,
+    // n_s, K]). Slot j holds the window that ends j tokens before the end of the batch (clamped to the old state),
+    // i.e. what build_conv_state writes for rollback group j. Equivalent to
+    // ssm_conv(concat(get_rows(states, ids), transpose(x), 0), c) (+ silu) plus the snapshot views of the concat.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * states,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * c,
+            int64_t               K,
+            bool                  silu);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,
@@ -2734,6 +2756,32 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // same, but the initial state of seq s is row ids[s] of states (read in place, e.g. from a recurrent cache):
+    //   states : [S_v*S_v*H, n_rows] (contiguous rows)
+    //   ids    : I32 [n_seqs]
+    // Backends without ids support must reject it in supports_op (src[6] != NULL).
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * states,
+            struct ggml_tensor  * ids,
+            int64_t               K);
+
+    // Qwen3-Next/3.5 gated delta net prologue folded into a gated_delta_net_ids node (returns gdn, scalar gate only).
+    // q, k, g and beta are then the raw inputs, the op computes per head and token
+    //   q, k <- scale(rms_norm(x, l2_eps), 1/sqrt(S_k))       (== build_gdn_l2_norm with l2_eps = eps/S_k)
+    //   g    <- softplus(g + dt_bias[h]) * A[h]               dt_bias, A: [H_v]
+    //   beta <- sigmoid(beta)
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_set_prologue(
+            struct ggml_tensor  * gdn,
+            struct ggml_tensor  * dt_bias,
+            struct ggml_tensor  * A,
+            float                 l2_eps);
 
     // DSA lightning indexer
     //
