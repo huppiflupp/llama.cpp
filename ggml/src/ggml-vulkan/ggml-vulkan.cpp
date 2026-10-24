@@ -17798,7 +17798,13 @@ static bool ggml_vk_can_fuse_unary_mul(const struct ggml_cgraph * cgraph, int un
     if (other == nullptr || other->type != unary->type) {
         return false;
     }
-    if (!ggml_is_contiguous_1(other) || !ggml_is_contiguous_1(unary->src[0])) {
+    // lab GGML_VK_LAB_UNARY_MUL=1: the unary input may be strided (the shader indexes it by its strides), e.g. the
+    // delta-net z as a view of the stacked qkvz projection with more than one token
+    static const bool lab_unary_mul = getenv("GGML_VK_LAB_UNARY_MUL") != nullptr;
+    if (!ggml_is_contiguous_1(other) || (!lab_unary_mul && !ggml_is_contiguous_1(unary->src[0]))) {
+        return false;
+    }
+    if (lab_unary_mul && unary->src[0]->nb[0] != ggml_type_size(unary->src[0]->type)) {
         return false;
     }
     // fastmod needs src to tile into dst
@@ -20922,6 +20928,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             ggml_vk_dispatch_census_add(fusion_string, fused_nodes);
         }
 
+        // lab: GGML_VK_LAB_TRACE_NODES=1 prints every dispatched node (or fusion) of every graph, in order
+        static const bool lab_trace_nodes = getenv("GGML_VK_LAB_TRACE_NODES") != nullptr;
+        if (lab_trace_nodes && enqueued) {
+            const ggml_tensor * tn = cgraph->nodes[i];
+            fprintf(stderr, "VKN %d %s%s%s %s\n", cgraph->n_nodes, fusion_string ? fusion_string : "",
+                    fusion_string ? ":" : "", tn->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(tn)) : ggml_op_name(tn->op),
+                    tn->name);
+        }
+
         if (vk_perf_logger_enabled && enqueued) {
             compute_ctx = ggml_vk_get_compute_ctx(ctx);
             if (!vk_perf_logger_concurrent) {
@@ -21214,6 +21229,33 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
         }
         return dist;
+    };
+
+    // lab GGML_VK_LAB_UNARY_MUL=1 (from halo-tuning glm/0008): a UNARY that could fuse with a MUL consumer whose other
+    // operand is not ready yet is not hoisted into an earlier set, which would separate the pair (e.g. the delta-net
+    // output gate rms_norm(o)*w*silu(z), where silu(z) is ready long before the norm); it is left for when it
+    // becomes the first unused node.
+    static const bool lab_unary_mul = getenv("GGML_VK_LAB_UNARY_MUL") != nullptr;
+    auto const &defer_unary_for_mul = [&](int u) -> bool {
+        if (!lab_unary_mul) {
+            return false;
+        }
+        const ggml_tensor * unary = graph->nodes[u];
+        if (unary->op != GGML_OP_UNARY) {
+            return false;
+        }
+        for (int k = u + 1; k < std::min(u + 15, graph->n_nodes); ++k) {
+            const ggml_tensor * mul = graph->nodes[k];
+            if (mul->op != GGML_OP_MUL || (mul->src[0] != unary && mul->src[1] != unary)) {
+                continue;
+            }
+            const ggml_tensor * other = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
+            if (other->op == GGML_OP_NONE || used_node_set.find(const_cast<ggml_tensor *>(other)) != used_node_set.end()) {
+                return false;
+            }
+            return ggml_vk_can_fuse_unary_mul(graph, u, k);
+        }
+        return false;
     };
 
     while (first_unused < graph->n_nodes) {
@@ -21861,7 +21903,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(hc_post_gate_pattern, j) ||
                 !gated_norm_order(j).empty() ||
                 is_mm_cpy16(j) ||
-                gdn_cpy_dist(j) > 0) {
+                gdn_cpy_dist(j) > 0 ||
+                defer_unary_for_mul(j)) {
                 continue;
             }
             bool ok = true;
@@ -23035,6 +23078,18 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 if (op->src[6] && op->src[6]->type != GGML_TYPE_I32) {
                     return false;
+                }
+                // the shader reads g and beta with the strides of beta (non-contiguous only as a scalar gate)
+                if (!ggml_is_contiguous(op->src[3]) || !ggml_is_contiguous(op->src[4])) {
+                    if (op->src[3]->ne[0] != 1 || !ggml_are_same_stride(op->src[3], op->src[4])) {
+                        return false;
+                    }
+                }
+                // no misaligned descriptor offsets (views of a stacked projection)
+                for (int i = 3; i <= 4; i++) {
+                    if (op->src[i]->view_offs % device->properties.limits.minStorageBufferOffsetAlignment != 0) {
+                        return false;
+                    }
                 }
                 if (ggml_get_op_params_i32(op, 1) != 0) {
                     // prologue (ggml_gated_delta_net_set_prologue): scalar gate, F32 dt bias and A

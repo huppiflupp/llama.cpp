@@ -6668,7 +6668,11 @@ struct ggml_tensor * ggml_gated_delta_net_ids(
     GGML_ASSERT(ggml_is_vector(ids) && ids->ne[0] == n_seqs);
 
     GGML_ASSERT(ggml_is_contiguous_rows(q) && ggml_is_contiguous_rows(k) && ggml_is_contiguous_rows(v));
-    GGML_ASSERT(ggml_is_contiguous(g) && ggml_is_contiguous(beta));
+    // g and beta contiguous, or (scalar gate) both strided alike, e.g. views of one stacked projection; backends
+    // check the strides in supports_op
+    GGML_ASSERT((ggml_is_contiguous(g) && ggml_is_contiguous(beta)) ||
+                (g->ne[0] == 1 && ggml_are_same_shape(g, beta) && ggml_are_same_stride(g, beta) &&
+                 g->nb[0] == sizeof(float)));
     GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
     GGML_ASSERT(g->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32);
     GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);

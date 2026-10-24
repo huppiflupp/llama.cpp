@@ -11376,8 +11376,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
-    GGML_ASSERT(ggml_is_contiguous(src_g));
-    GGML_ASSERT(ggml_is_contiguous(src_beta));
+    // g and beta are read by their strides: contiguous, or a scalar gate strided like beta (views of one projection)
+    GGML_ASSERT((ggml_is_contiguous(src_g) && ggml_is_contiguous(src_beta)) ||
+                (src_g->ne[0] == 1 && ggml_are_same_stride(src_g, src_beta) && src_g->nb[0] == sizeof(float)));
     GGML_ASSERT(src_ids ? ggml_is_contiguous_rows(src_state) : ggml_is_contiguous(src_state));
     GGML_ASSERT(!prologue || src_ids != nullptr);
 

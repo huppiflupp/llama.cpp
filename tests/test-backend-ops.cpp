@@ -7162,15 +7162,18 @@ struct test_qwen_gdn_ids : public test_case {
     const int64_t kv_head;  // first cell written
     const int64_t rollback; // plane the initial states are read from
     const bool    prologue;
+    const bool    stacked;  // (prologue) raw beta and alpha as views of one [beta; alpha] projection (LLAMA_LAB_STACK_BA)
 
     std::string vars() override {
-        return VARS_TO_STR10(S, H_k, H_v, n_seq_tokens, n_seqs, K, mem_size, kv_head, rollback, prologue);
+        return VARS_TO_STR10(S, H_k, H_v, n_seq_tokens, n_seqs, K, mem_size, kv_head, rollback, prologue) +
+               (stacked ? ",stacked=1" : "");
     }
 
     test_qwen_gdn_ids(int64_t S = 32, int64_t H_k = 2, int64_t H_v = 4, int64_t n_seq_tokens = 3, int64_t n_seqs = 1,
-            int64_t K = 3, int64_t mem_size = 2, int64_t kv_head = 1, int64_t rollback = 0, bool prologue = false)
+            int64_t K = 3, int64_t mem_size = 2, int64_t kv_head = 1, int64_t rollback = 0, bool prologue = false,
+            bool stacked = false)
         : S(S), H_k(H_k), H_v(H_v), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K), mem_size(mem_size),
-          kv_head(kv_head), rollback(rollback), prologue(prologue) {}
+          kv_head(kv_head), rollback(rollback), prologue(prologue), stacked(stacked) {}
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -7205,7 +7208,13 @@ struct test_qwen_gdn_ids : public test_case {
 
         const float eps = 1e-6f / (float) S;
         ggml_tensor * g;
-        if (prologue) {
+        if (prologue && stacked) {
+            ggml_tensor * ba = ggml_new_tensor_2d(ctx, type, 2 * H_v, n_seq_tokens * n_seqs);
+            ggml_set_name(ba, "ba");
+            beta = ggml_view_4d(ctx, ba, 1, H_v, n_seq_tokens, n_seqs, ba->nb[0], ba->nb[1], ba->nb[1] * n_seq_tokens, 0);
+            g    = ggml_view_4d(ctx, ba, 1, H_v, n_seq_tokens, n_seqs, ba->nb[0], ba->nb[1], ba->nb[1] * n_seq_tokens,
+                                ggml_row_size(type, H_v));
+        } else if (prologue) {
             g = ggml_reshape_4d(ctx, alpha, 1, H_v, n_seq_tokens, n_seqs);
         } else {
             q    = ggml_scale(ctx, ggml_rms_norm(ctx, q, eps), 1.0f / sqrtf((float) S));
@@ -7241,7 +7250,7 @@ struct test_qwen_gdn_ids : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
-            if (strcmp(t->name, "alpha") == 0) {
+            if (strcmp(t->name, "alpha") == 0 || strcmp(t->name, "ba") == 0) {
                 init_tensor_uniform(t, -4.0f, 4.0f);
             } else if (strcmp(t->name, "dt") == 0) {
                 init_tensor_uniform(t, -1.0f, 1.0f);
@@ -17837,6 +17846,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qwen_gdn_ids(32, 2, 4, 3, 2, 3, 4, 1, 1, pro)); // 2 seqs: no in-place fusion
         test_cases.emplace_back(new test_qwen_gdn_ids(32, 2, 4, 5, 1, 3, 2, 1, 0, pro)); // n_tokens > K
         test_cases.emplace_back(new test_qwen_gdn_ids(64, 4, 4, 2, 1, 2, 2, 0, 1, pro)); // H_k == H_v
+    }
+    // prologue with beta and alpha as strided views of one stacked projection
+    for (int64_t n_tok : { 1, 3, 5 }) {
+        test_cases.emplace_back(new test_qwen_gdn_ids(32, 2, 4, n_tok, 1, 3, 2, 1, 2, true, true));
+        test_cases.emplace_back(new test_qwen_gdn_ids(128, 16, 32, n_tok, 1, 3, 1, 0, 1, true, true)); // Qwen3.6-35B-A3B
     }
     for (int64_t n_tok : { 1, 2, 3, 5 }) {
         for (int64_t rb : { 0, 2 }) {
