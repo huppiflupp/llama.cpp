@@ -34,6 +34,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <fstream>
 #include <mutex>
 #include <numeric>
 #include <regex>
@@ -2935,16 +2936,45 @@ std::shared_ptr<const llama_mtp_draft_vocab> llama_model::mtp_draft_vocab_get(in
         return it->second.lock();
     }
 
-    std::string why;
-    if (!mtp_draft_vocab_ids_follow_merge_order(vocab, why)) {
-        LLAMA_LOG_ERROR("%s: mtp_draft_vocab = %d ignored: %s\n", __func__, n_keep, why.c_str());
-        return nullptr;
+    // LLAMA_MTP_VOCAB_FILE: keep the token ids listed in this file (one per line, e.g. ranked by frequency)
+    // instead of the ids < n_keep; control and user-defined tokens stay in either way
+    std::vector<char> keep(n_vocab, 0);
+    if (const char * vf = getenv("LLAMA_MTP_VOCAB_FILE"); vf && *vf) {
+        std::ifstream f(vf);
+        if (!f) {
+            LLAMA_LOG_ERROR("%s: LLAMA_MTP_VOCAB_FILE %s not readable, drafting over the full vocabulary\n", __func__, vf);
+            return nullptr;
+        }
+        std::string line;
+        size_t n_read = 0;
+        while (std::getline(f, line)) {
+            if (line.empty()) {
+                continue;
+            }
+            const long v = std::strtol(line.c_str(), nullptr, 10);
+            if (v < 0 || v >= n_vocab) {
+                LLAMA_LOG_ERROR("%s: LLAMA_MTP_VOCAB_FILE: token id %ld out of range\n", __func__, v);
+                return nullptr;
+            }
+            keep[v] = 1;
+            n_read++;
+        }
+        LLAMA_LOG_INFO("%s: mtp_draft_vocab: %zu token ids from %s\n", __func__, n_read, vf);
+    } else {
+        std::string why;
+        if (!mtp_draft_vocab_ids_follow_merge_order(vocab, why)) {
+            LLAMA_LOG_ERROR("%s: mtp_draft_vocab = %d ignored: %s\n", __func__, n_keep, why.c_str());
+            return nullptr;
+        }
+        for (int t = 0; t < n_keep; ++t) {
+            keep[t] = 1;
+        }
     }
     std::vector<int64_t> ids;
     ids.reserve(n_vocab);
     for (int t = 0; t < n_vocab; ++t) {
         const int attr = (int) vocab.token_get_attr(t);
-        if (t < n_keep || (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED))) {
+        if (keep[t] || (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED))) {
             ids.push_back(t);
         }
     }
