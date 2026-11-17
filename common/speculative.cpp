@@ -2079,8 +2079,27 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
                 this->params.size_n, this->params.size_m, this->params.min_hits);
     }
 
-    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
-        // noop
+    // lab switches (gufo prompt lookup): LLAMA_LAB_NGRAM_PROMPT_ONLY=1 matches keys in the prompt only,
+    // LLAMA_LAB_NGRAM_BACKOFF=K skips K draft calls after a draft of which less than half was accepted
+    std::vector<size_t>  lab_n_prompt  = std::vector<size_t>(n_seq, SIZE_MAX);
+    std::vector<int32_t> lab_last_len  = std::vector<int32_t>(n_seq, 0);
+    std::vector<int32_t> lab_cooldown  = std::vector<int32_t>(n_seq, 0);
+
+    static bool lab_prompt_only() {
+        static const bool v = [] { const char * e = getenv("LLAMA_LAB_NGRAM_PROMPT_ONLY"); return e && atoi(e) != 0; }();
+        return v;
+    }
+    static int32_t lab_backoff() {
+        static const int32_t v = [] { const char * e = getenv("LLAMA_LAB_NGRAM_BACKOFF"); return e ? atoi(e) : 0; }();
+        return v;
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            lab_n_prompt[seq_id] = lab_prompt_only() ? prompt.size() : SIZE_MAX;
+            lab_last_len[seq_id] = 0;
+            lab_cooldown[seq_id] = 0;
+        }
     }
 
     bool process(const common_batch & /*batch*/) override {
@@ -2096,13 +2115,27 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
             if (!dp.drafting) {
                 continue;
             }
+            lab_last_len[seq_id] = 0;
+            if (lab_cooldown[seq_id] > 0) {
+                lab_cooldown[seq_id]--;
+                dp.result->clear();
+                continue;
+            }
 
-            *dp.result = common_ngram_simple_draft(config, *dp.prompt, dp.id_last);
+            *dp.result = common_ngram_simple_draft(config, *dp.prompt, dp.id_last, lab_n_prompt[seq_id]);
+            lab_last_len[seq_id] = (int32_t) dp.result->size();
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (is_other || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        const int32_t len = lab_last_len[seq_id];
+        if (lab_backoff() > 0 && len > 0 && 2 * (int32_t) n_accepted < len) {
+            lab_cooldown[seq_id] = lab_backoff();
+        }
+        lab_last_len[seq_id] = 0;
     }
 };
 

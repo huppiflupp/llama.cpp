@@ -29,7 +29,8 @@ struct common_ngram_simple_config {
 // Searches for a n-gram in the history and checks whether a draft sequence should be generated.
 llama_tokens common_ngram_simple_draft(
         const common_ngram_simple_config & config,
-        const llama_tokens & tokens, llama_token sampled);
+        const llama_tokens & tokens, llama_token sampled,
+        size_t search_end = SIZE_MAX); // a match must end before this position (e.g. the prompt length)
 
 
 // n-gram map

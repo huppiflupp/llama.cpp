@@ -48,7 +48,7 @@ static std::string common_tokens_to_str(const llama_tokens & inp, size_t start, 
  */
 llama_tokens common_ngram_simple_draft(
         const common_ngram_simple_config & config,
-        const llama_tokens & tokens, llama_token sampled) {
+        const llama_tokens & tokens, llama_token sampled, size_t search_end) {
 
     // Simple implementation of self-speculative decoding without a draft model.
     //
@@ -77,6 +77,9 @@ llama_tokens common_ngram_simple_draft(
     size_t match_pos = 0; // we ignore position 0, position 0 == no match
                           // search backwards, but skip the current match (we are currently there)
     for (size_t j = cur_len - n_draft_min - 1; j > 0; --j) {
+        if (j + n_draft_min > search_end) {
+            continue;
+        }
         bool match = true;
         for (size_t k = 0; k < pattern.size(); ++k) {
             if (tokens[j + k] != pattern[k]) {
