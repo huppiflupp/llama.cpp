@@ -18660,6 +18660,13 @@ static int ggml_vk_gdn_cache_pattern(const ggml_backend_vk_context * ctx, const 
         tail_off  = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
         state     = gdn->src[5];
         has_ids   = gdn->src[6] != nullptr;
+        // the chunked prefill form and the q/k norm prepass write the state themselves: no fusion there
+        if (K == 1 && n_tokens >= ggml_vk_gdn_chunk_min) {
+            return 0;
+        }
+        if (ctx != nullptr && (ctx->gdn_qk.count(gdn) || ggml_vk_gdn_chunk_ok(ctx, gdn, gdn->src[0], gdn->src[1]))) {
+            return 0;
+        }
     } else if (gdn->op == GGML_OP_SSM_CONV_IDS && !conv_disabled) {
         const int64_t nc  = gdn->src[1]->ne[0];
         const int64_t nr  = gdn->src[1]->ne[1];
@@ -18671,14 +18678,6 @@ static int ggml_vk_gdn_cache_pattern(const ggml_backend_vk_context * ctx, const 
         state     = gdn->src[2];
         has_ids   = true;
     } else {
-        return 0;
-    }
-
-    // the chunked prefill form and the q/k norm prepass write the state themselves: no fusion there
-    if (K == 1 && n_tokens >= ggml_vk_gdn_chunk_min) {
-        return 0;
-    }
-    if (ctx != nullptr && (ctx->gdn_qk.count(gdn) || ggml_vk_gdn_chunk_ok(ctx, gdn, gdn->src[0], gdn->src[1]))) {
         return 0;
     }
 
